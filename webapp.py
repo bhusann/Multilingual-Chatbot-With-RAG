@@ -635,6 +635,11 @@ async def websocket_voice(ws: WebSocket):
                             }
                         )
 
+                        # Signal client to start listening again
+                        await ws.send_json(
+                            {"status": "listen"}
+                        )
+
                     elif text == "ping":
                         await ws.send_json(
                             {"status": "ready"}

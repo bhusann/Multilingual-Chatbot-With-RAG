@@ -276,7 +276,7 @@
             autocomplete="off"
         >
         <button class="send-btn" id="sendBtn" disabled title="Send">➤</button>
-        <button class="mic-btn" id="micBtn" title="Hold to speak">🎤</button>
+        <button class="mic-btn" id="micBtn" title="Click to start conversation">🎤</button>
     </div>
 
     <div class="status">
@@ -296,48 +296,79 @@
         const statusText = document.getElementById('statusText');
 
         let chatHistory = [];
-        let isRecording = false;
         let ws = null;
         let audioContext = null;
         let mediaStream = null;
         let processor = null;
+
+        // Conversation state machine
+        let conversationMode = false;  // Is conversation active?
+        let isRecording = false;       // Is mic capturing audio right now?
+        let isSpeaking = false;        // Is TTS audio playing?
 
         // ========== WEBSOCKET ==========
         function connectVoiceSocket() {
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${location.host}/ws/voice`);
 
-            ws.onopen = () => console.log('🔌 Voice socket connected');
+            ws.onopen = () => {
+                console.log('🔌 Voice socket connected');
+                updateStatus('ready');
+            };
+
             ws.onclose = () => {
                 console.log('🔌 Voice socket disconnected, reconnecting...');
+                updateStatus('offline');
                 setTimeout(connectVoiceSocket, 2000);
             };
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
 
-                if (data.error) {
-                    addMessage(data.error, 'assistant');
-                    statusText.textContent = 'Ready';
+                // Server says: start listening again
+                if (data.status === 'listen') {
+                    if (conversationMode && !isRecording) {
+                        startRecording();
+                    }
                     return;
                 }
 
-                if (data.text && data.reply) {
-                    // Show transcribed text
-                    if (welcome) welcome.style.display = 'none';
-                    addMessage(data.text, 'user');
-                    addMessage(data.reply, 'assistant');
-
-                    // Update history
-                    chatHistory.push({ role: 'user', content: data.text });
-                    chatHistory.push({ role: 'assistant', content: data.reply });
-                    if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
-
-                    // Speak reply
-                    if (data.reply) speakText(data.reply);
+                // Error from server
+                if (data.error) {
+                    if (data.error === 'No speech detected' || data.error.includes('too short')) {
+                        // Just restart listening silently
+                        if (conversationMode) {
+                            startRecording();
+                        }
+                    } else {
+                        addMessage(data.error, 'assistant');
+                    }
+                    return;
                 }
 
-                statusText.textContent = 'Ready';
+                // Got a reply
+                if (data.text !== undefined && data.reply !== undefined) {
+                    if (data.text) {
+                        if (welcome) welcome.style.display = 'none';
+                        addMessage(data.text, 'user');
+                    }
+
+                    if (data.reply) {
+                        addMessage(data.reply, 'assistant');
+                        chatHistory.push({ role: 'user', content: data.text });
+                        chatHistory.push({ role: 'assistant', content: data.reply });
+                        if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
+
+                        // Speak the reply, then auto-restart listening
+                        speakText(data.reply).then(() => {
+                            isSpeaking = false;
+                            if (conversationMode) {
+                                startRecording();
+                            }
+                        });
+                        isSpeaking = true;
+                    }
+                }
             };
         }
 
@@ -459,14 +490,50 @@
         }
 
         // ========== VOICE INPUT (WebSocket + Web Audio API) ==========
-        micBtn.addEventListener('mousedown', startRecording);
-        micBtn.addEventListener('mouseup', stopRecording);
-        micBtn.addEventListener('mouseleave', stopRecording);
-        micBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
-        micBtn.addEventListener('touchend', stopRecording);
+        micBtn.addEventListener('click', toggleConversation);
+
+        function toggleConversation() {
+            if (conversationMode) {
+                stopConversation();
+            } else {
+                startConversation();
+            }
+        }
+
+        function startConversation() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                addMessage('Voice connection not ready. Please wait...', 'assistant');
+                return;
+            }
+
+            conversationMode = true;
+            micBtn.classList.add('recording');
+            micBtn.innerHTML = '⏹️';
+            updateStatus('listening');
+            startRecording();
+        }
+
+        function stopConversation() {
+            conversationMode = false;
+
+            // Stop any active recording
+            if (isRecording) {
+                stopRecording();
+            }
+
+            // Stop any playing audio
+            if (isSpeaking) {
+                window.speechSynthesis?.cancel();
+                isSpeaking = false;
+            }
+
+            micBtn.classList.remove('recording');
+            micBtn.innerHTML = '🎤';
+            updateStatus('ready');
+        }
 
         async function startRecording() {
-            if (isRecording || !ws || ws.readyState !== WebSocket.OPEN) return;
+            if (isRecording) return;
 
             try {
                 mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -481,14 +548,11 @@
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
                 const source = audioContext.createMediaStreamSource(mediaStream);
 
-                // ScriptProcessorNode: get raw PCM float32 samples
-                // Buffer size 4096 = ~256ms chunks at 16kHz
                 processor = audioContext.createScriptProcessor(4096, 1, 1);
 
                 processor.onaudioprocess = (e) => {
                     if (!isRecording) return;
                     const inputData = e.inputBuffer.getChannelData(0);
-                    // Send raw float32 PCM as binary
                     ws.send(inputData.buffer);
                 };
 
@@ -496,12 +560,12 @@
                 processor.connect(audioContext.destination);
 
                 isRecording = true;
-                micBtn.classList.add('recording');
-                statusText.textContent = 'Listening...';
+                updateStatus('listening');
 
             } catch (err) {
                 console.error('Microphone error:', err);
-                statusText.textContent = 'Microphone access denied';
+                addMessage('Microphone access denied. Please allow microphone and try again.', 'assistant');
+                stopConversation();
             }
         }
 
@@ -509,10 +573,7 @@
             if (!isRecording) return;
 
             isRecording = false;
-            micBtn.classList.remove('recording');
-            statusText.textContent = 'Processing...';
 
-            // Clean up audio nodes
             if (processor) {
                 processor.disconnect();
                 processor = null;
@@ -526,10 +587,8 @@
                 mediaStream = null;
             }
 
-            // Tell server the utterance is done
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send('done');
-            }
+            updateStatus('processing');
+            ws.send('done');
         }
 
         // ========== TTS ==========
@@ -544,15 +603,51 @@
                 if (response.ok) {
                     const audioBlob = await response.blob();
                     const audioUrl = URL.createObjectURL(audioBlob);
-                    const audio = new Audio(audioUrl);
-                    audio.play();
+                    return new Promise((resolve) => {
+                        const audio = new Audio(audioUrl);
+                        audio.onended = () => {
+                            URL.revokeObjectURL(audioUrl);
+                            resolve();
+                        };
+                        audio.onerror = () => resolve();
+                        audio.play();
+                    });
                 }
             } catch (e) {
                 console.log('TTS failed, skipping audio');
             }
+            return Promise.resolve();
         }
 
         // ========== HELPERS ==========
+        function updateStatus(state) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+
+            switch (state) {
+                case 'ready':
+                    dot.className = 'status-dot online';
+                    text.textContent = conversationMode ? 'Active — speak now' : 'Ready';
+                    break;
+                case 'listening':
+                    dot.className = 'status-dot online';
+                    text.textContent = 'Listening...';
+                    break;
+                case 'processing':
+                    dot.className = 'status-dot online';
+                    text.textContent = 'Thinking...';
+                    break;
+                case 'speaking':
+                    dot.className = 'status-dot online';
+                    text.textContent = 'Speaking...';
+                    break;
+                case 'offline':
+                    dot.className = 'status-dot offline';
+                    text.textContent = 'Disconnected';
+                    break;
+            }
+        }
+
         function addMessage(text, role) {
             const el = createMessageElement(text, role);
             chatContainer.appendChild(el);
