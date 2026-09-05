@@ -290,7 +290,7 @@ FINAL ANSWER RULES
   clearly.
 """
 
-    def _run_agent_loop(self, system_prompt, user_text, prior_turns, cancel_event=None, stream=False):
+    def _run_agent_loop(self, system_prompt, user_text, prior_turns, cancel_event=None, stream=False, rag_context=None):
         """
         Run the tool-calling loop until the model answers or the
         round limit is reached. Returns the final text reply.
@@ -302,6 +302,15 @@ FINAL ANSWER RULES
         messages = [
             {"role": "system", "content": system_prompt},
         ]
+
+        # Inject RAG context if available
+        if rag_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": rag_context,
+                }
+            )
 
         # Prior multi-turn context (user/assistant pairs)
         messages.extend(prior_turns)
@@ -462,7 +471,7 @@ FINAL ANSWER RULES
         # Round limit reached without a final answer
         return ""
 
-    def _run_agent_loop_streaming(self, system_prompt, user_text, prior_turns, cancel_event=None):
+    def _run_agent_loop_streaming(self, system_prompt, user_text, prior_turns, cancel_event=None, rag_context=None):
         """
         Run the tool-calling loop with streaming on the FINAL answer.
         Tool-call rounds are non-streaming. Returns an iterator of
@@ -472,6 +481,15 @@ FINAL ANSWER RULES
         messages = [
             {"role": "system", "content": system_prompt},
         ]
+
+        # Inject RAG context if available
+        if rag_context:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": rag_context,
+                }
+            )
 
         messages.extend(prior_turns)
 
@@ -674,6 +692,7 @@ FINAL ANSWER RULES
         chat_history,
         cancel_event=None,
         stream=False,
+        rag_context=None,
     ):
         """
         Search the web (as many rounds as the model wants) and return
@@ -728,6 +747,7 @@ FINAL ANSWER RULES
                 user_text=user_text,
                 prior_turns=prior_turns,
                 cancel_event=cancel_event,
+                rag_context=rag_context,
             ):
                 full_reply += chunk
                 yield chunk
@@ -763,6 +783,7 @@ FINAL ANSWER RULES
                     user_text=user_text,
                     prior_turns=prior_turns,
                     cancel_event=cancel_event,
+                    rag_context=rag_context,
                 )
 
             except Exception as e:

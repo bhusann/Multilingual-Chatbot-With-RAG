@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin — Document Management</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* Login screen */
+        .login-screen {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+
+        .login-box {
+            background: #1e293b;
+            padding: 40px;
+            border-radius: 12px;
+            border: 1px solid #334155;
+            width: 100%;
+            max-width: 400px;
+        }
+
+        .login-box h2 {
+            text-align: center;
+            margin-bottom: 24px;
+            color: #f1f5f9;
+        }
+
+        .login-box input {
+            width: 100%;
+            padding: 12px 16px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            color: #e2e8f0;
+            font-size: 15px;
+            margin-bottom: 16px;
+            outline: none;
+        }
+
+        .login-box input:focus {
+            border-color: #2563eb;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn-primary {
+            background: #2563eb;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #1d4ed8;
+        }
+
+        .btn-danger {
+            background: #dc2626;
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: #b91c1c;
+        }
+
+        .btn-small {
+            padding: 6px 12px;
+            width: auto;
+            font-size: 13px;
+        }
+
+        .error-msg {
+            color: #ef4444;
+            text-align: center;
+            margin-bottom: 16px;
+            font-size: 14px;
+            display: none;
+        }
+
+        /* Admin panel */
+        .admin-panel {
+            display: none;
+        }
+
+        .admin-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #334155;
+        }
+
+        .admin-header h1 {
+            font-size: 22px;
+            color: #f1f5f9;
+        }
+
+        .upload-zone {
+            background: #1e293b;
+            border: 2px dashed #334155;
+            border-radius: 12px;
+            padding: 32px;
+            text-align: center;
+            margin-bottom: 24px;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .upload-zone:hover,
+        .upload-zone.dragover {
+            border-color: #2563eb;
+        }
+
+        .upload-zone p {
+            color: #94a3b8;
+            font-size: 14px;
+        }
+
+        .upload-zone .icon {
+            font-size: 36px;
+            margin-bottom: 8px;
+        }
+
+        #fileInput {
+            display: none;
+        }
+
+        .documents-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .doc-card {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .doc-info {
+            flex: 1;
+        }
+
+        .doc-info .name {
+            font-weight: 500;
+            color: #f1f5f9;
+            margin-bottom: 4px;
+        }
+
+        .doc-info .meta {
+            font-size: 12px;
+            color: #64748b;
+        }
+
+        .doc-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #64748b;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #334155;
+            border-top: 2px solid #2563eb;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #1e293b;
+            border: 1px solid #334155;
+            padding: 12px 20px;
+            border-radius: 8px;
+            color: #e2e8f0;
+            font-size: 14px;
+            animation: slideUp 0.3s ease;
+            z-index: 1000;
+        }
+
+        @keyframes slideUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- LOGIN SCREEN -->
+    <div class="login-screen" id="loginScreen">
+        <div class="login-box">
+            <h2>🔐 Admin Login</h2>
+            <div class="error-msg" id="loginError">Wrong password</div>
+            <input
+                type="password"
+                id="passwordInput"
+                placeholder="Enter admin password"
+                autofocus
+            >
+            <button class="btn btn-primary" id="loginBtn">Login</button>
+        </div>
+    </div>
+
+    <!-- ADMIN PANEL -->
+    <div class="admin-panel" id="adminPanel">
+        <div class="container">
+            <div class="admin-header">
+                <h1>📂 Document Management</h1>
+                <a href="/" style="color: #64748b; text-decoration: none; font-size: 14px;">← Back to Chat</a>
+            </div>
+
+            <!-- Upload zone -->
+            <div class="upload-zone" id="uploadZone">
+                <div class="icon">📄</div>
+                <p><strong>Drop PDF or TXT file here</strong></p>
+                <p>or click to browse</p>
+            </div>
+            <input type="file" id="fileInput" accept=".pdf,.txt">
+
+            <!-- Documents list -->
+            <div class="documents-list" id="documentsList">
+                <div class="empty-state" id="emptyState">
+                    <p>No documents uploaded yet.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const loginScreen = document.getElementById('loginScreen');
+        const adminPanel = document.getElementById('adminPanel');
+        const loginError = document.getElementById('loginError');
+        const passwordInput = document.getElementById('passwordInput');
+        const loginBtn = document.getElementById('loginBtn');
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const documentsList = document.getElementById('documentsList');
+        const emptyState = document.getElementById('emptyState');
+
+        let token = localStorage.getItem('admin_token');
+
+        // Check if already logged in
+        if (token) {
+            showAdminPanel();
+        }
+
+        // ========== LOGIN ==========
+        loginBtn.addEventListener('click', login);
+        passwordInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') login();
+        });
+
+        async function login() {
+            const password = passwordInput.value;
+            if (!password) return;
+
+            try {
+                const res = await fetch('/admin/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password }),
+                });
+
+                if (res.ok) {
+                    const data = await res.json();
+                    token = data.token;
+                    localStorage.setItem('admin_token', token);
+                    showAdminPanel();
+                } else {
+                    loginError.style.display = 'block';
+                    loginError.textContent = 'Wrong password';
+                }
+            } catch (e) {
+                loginError.style.display = 'block';
+                loginError.textContent = 'Connection error';
+            }
+        }
+
+        function showAdminPanel() {
+            loginScreen.style.display = 'none';
+            adminPanel.style.display = 'block';
+            loadDocuments();
+        }
+
+        // ========== DOCUMENTS ==========
+        async function loadDocuments() {
+            try {
+                const res = await fetch('/admin/api/documents', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`,
+                    },
+                    credentials: 'include',
+                });
+
+                if (res.status === 401) {
+                    localStorage.removeItem('admin_token');
+                    loginScreen.style.display = 'flex';
+                    adminPanel.style.display = 'none';
+                    return;
+                }
+
+                const data = await res.json();
+                renderDocuments(data.documents);
+
+            } catch (e) {
+                console.error('Failed to load documents:', e);
+            }
+        }
+
+        function renderDocuments(docs) {
+            documentsList.innerHTML = '';
+
+            if (!docs || docs.length === 0) {
+                documentsList.innerHTML = '<div class="empty-state"><p>No documents uploaded yet.</p></div>';
+                return;
+            }
+
+            docs.forEach(doc => {
+                const card = document.createElement('div');
+                card.className = 'doc-card';
+                card.innerHTML = `
+                    <div class="doc-info">
+                        <div class="name">${escapeHtml(doc.filename)}</div>
+                        <div class="meta">
+                            ${doc.total_chunks || 0} chunks
+                            ${doc.upload_date ? ' • ' + new Date(doc.upload_date).toLocaleDateString() : ''}
+                            ${doc.scheme_name ? ' • ' + escapeHtml(doc.scheme_name) : ''}
+                        </div>
+                    </div>
+                    <div class="doc-actions">
+                        <button class="btn btn-danger btn-small" onclick="deleteDocument('${doc.doc_id}', '${escapeHtml(doc.filename)}')">
+                            Delete
+                        </button>
+                    </div>
+                `;
+                documentsList.appendChild(card);
+            });
+        }
+
+        async function deleteDocument(docId, filename) {
+            if (!confirm(`Delete "${filename}" and all its chunks?`)) return;
+
+            try {
+                const res = await fetch(`/admin/api/documents/${docId}`, {
+                    method: 'DELETE',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                    },
+                    credentials: 'include',
+                });
+
+                if (res.ok) {
+                    showToast(`Deleted "${filename}"`);
+                    loadDocuments();
+                } else {
+                    showToast('Delete failed');
+                }
+            } catch (e) {
+                showToast('Connection error');
+            }
+        }
+
+        // ========== UPLOAD ==========
+        uploadZone.addEventListener('click', () => fileInput.click());
+
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+
+        uploadZone.addEventListener('dragleave', () => {
+            uploadZone.classList.remove('dragover');
+        });
+
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) uploadFile(file);
+        });
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files[0]) uploadFile(fileInput.files[0]);
+        });
+
+        async function uploadFile(file) {
+            const ext = file.name.split('.').pop().toLowerCase();
+            if (!['pdf', 'txt'].includes(ext)) {
+                showToast('Only PDF and TXT files are supported');
+                return;
+            }
+
+            uploadZone.innerHTML = `
+                <div class="icon"><span class="spinner"></span></div>
+                <p><strong>Uploading ${escapeHtml(file.name)}...</strong></p>
+            `;
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const res = await fetch('/admin/api/upload', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                    },
+                    credentials: 'include',
+                    body: formData,
+                });
+
+                const result = await res.json();
+
+                if (result.status === 'success') {
+                    showToast(`Uploaded: ${result.chunks} chunks`);
+                } else if (result.status === 'skipped') {
+                    showToast('Document already exists (duplicate)');
+                } else {
+                    showToast(`Upload failed: ${result.reason}`);
+                }
+
+                // Reset upload zone
+                uploadZone.innerHTML = `
+                    <div class="icon">📄</div>
+                    <p><strong>Drop PDF or TXT file here</strong></p>
+                    <p>or click to browse</p>
+                `;
+
+                loadDocuments();
+
+            } catch (e) {
+                showToast('Upload failed');
+                uploadZone.innerHTML = `
+                    <div class="icon">📄</div>
+                    <p><strong>Drop PDF or TXT file here</strong></p>
+                    <p>or click to browse</p>
+                `;
+            }
+        }
+
+        // ========== HELPERS ==========
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function showToast(msg) {
+            const existing = document.querySelector('.toast');
+            if (existing) existing.remove();
+
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            toast.textContent = msg;
+            document.body.appendChild(toast);
+
+            setTimeout(() => toast.remove(), 3000);
+        }
+    </script>
+</body>
+</html>

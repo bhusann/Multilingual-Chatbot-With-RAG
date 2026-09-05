@@ -23,6 +23,8 @@ from rag.ingest import (
     ingest_folder,
 )
 
+from rag.retriever import Retriever
+
 __all__ = [
     "EmbeddingModel",
     "embed_texts",
@@ -33,4 +35,5 @@ __all__ = [
     "chunk_text",
     "ingest_document",
     "ingest_folder",
+    "Retriever",
 ]

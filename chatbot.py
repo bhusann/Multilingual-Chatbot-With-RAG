@@ -30,6 +30,26 @@ from llm_service import llm_service
 
 
 # ============================================================
+# RAG RETRIEVER
+# ============================================================
+
+_rag_retriever = None
+
+
+def get_rag_retriever():
+    """Lazy-load the RAG retriever (avoids loading
+    embedding model at startup if RAG is not used)."""
+
+    global _rag_retriever
+
+    if _rag_retriever is None:
+        from rag.retriever import Retriever
+        _rag_retriever = Retriever()
+
+    return _rag_retriever
+
+
+# ============================================================
 # CONFIG
 # ============================================================
 
@@ -1071,6 +1091,28 @@ def ask_opencode(
     )
 
     # ----------------------------------------
+    # RAG retrieval: search for relevant chunks
+    # ----------------------------------------
+
+    rag_context = None
+    rag_sources = []
+
+    try:
+        retriever = get_rag_retriever()
+        rag_context, rag_sources = retriever.get_context(
+            user_text
+        )
+
+        if rag_context:
+            print(
+                f"📚 RAG: found {len(rag_sources)} "
+                f"relevant chunks"
+            )
+
+    except Exception as e:
+        print(f"⚠️ RAG retrieval failed: {e}")
+
+    # ----------------------------------------
     # Search the web + ask the LLM
     # ----------------------------------------
 
@@ -1079,6 +1121,7 @@ def ask_opencode(
         chat_history=chat_history,
         cancel_event=cancel_event,
         stream=stream,
+        rag_context=rag_context,
     )
 
 
