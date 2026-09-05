@@ -5,13 +5,14 @@ Document ingestion pipeline for the RAG system.
 
 Handles:
 - PDF text extraction (PyMuPDF)
-- TXT file reading
+- Any text-readable file (.txt, .md, .json, .py, .csv, etc.)
 - Text chunking
 - Embedding generation
 - Persistent storage in Chroma
 
 Usage:
     python -m rag.ingest path/to/document.pdf
+    python -m rag.ingest path/to/document.md
     python -m rag.ingest path/to/folder/
 """
 
@@ -64,24 +65,53 @@ def extract_text_from_pdf(filepath):
 
 def extract_text_from_txt(filepath):
     """
-    Read text from a TXT file.
+    Read text from any text-readable file.
+    Tries UTF-8 first, falls back to latin-1.
 
     Returns list with a single dict.
     """
 
-    with open(filepath, "r", encoding="utf-8") as f:
+    # Try UTF-8 first, then latin-1 (covers almost everything)
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            with open(filepath, "r", encoding=encoding) as f:
+                text = f.read()
+            if text.strip():
+                return [{"text": text.strip(), "page": 0}]
+        except (UnicodeDecodeError, ValueError):
+            continue
 
-        text = f.read()
+    return []
 
-    if not text.strip():
-        return []
 
-    return [{"text": text.strip(), "page": 0}]
+# All text-readable extensions we support
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst",
+    ".json", ".jsonl", ".jsonc",
+    ".csv", ".tsv",
+    ".py", ".pyw",
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".java", ".kt", ".scala",
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
+    ".go", ".rs", ".swift", ".rb", ".php",
+    ".sh", ".bash", ".zsh", ".fish",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".xml", ".html", ".htm", ".css", ".scss",
+    ".sql",
+    ".r", ".R", ".lua", ".pl", ".pm",
+    ".env", ".gitignore", ".dockerignore",
+    ".log", ".diff", ".patch",
+    ".tex", ".bib",
+    ".srt", ".vtt",
+}
 
 
 def extract_text(filepath):
     """
     Extract text from a file based on extension.
+
+    PDF → pymupdf extraction
+    Everything else → read as text (UTF-8/latin-1)
 
     Returns list of dicts with 'text' and 'page' keys.
     """
@@ -91,13 +121,8 @@ def extract_text(filepath):
     if ext == ".pdf":
         return extract_text_from_pdf(filepath)
 
-    elif ext == ".txt":
-        return extract_text_from_txt(filepath)
-
-    else:
-        raise ValueError(
-            f"Unsupported file type: {ext}"
-        )
+    # Accept any file — try reading as text
+    return extract_text_from_txt(filepath)
 
 
 def ingest_document(
@@ -294,7 +319,7 @@ def ingest_folder(
 
         ext = os.path.splitext(filename)[1].lower()
 
-        if ext in (".pdf", ".txt"):
+        if ext == ".pdf" or ext in TEXT_EXTENSIONS or not ext:
 
             filepath = os.path.join(
                 folder_path, filename
