@@ -297,14 +297,9 @@
 
         let chatHistory = [];
         let ws = null;
-        let audioContext = null;
-        let mediaStream = null;
-        let processor = null;
-
-        // Conversation state machine
-        let conversationMode = false;  // Is conversation active?
-        let isRecording = false;       // Is mic capturing audio right now?
-        let isSpeaking = false;        // Is TTS audio playing?
+        let isConversationActive = false;
+        let ttsAudioQueue = [];
+        let isPlayingTTS = false;
 
         // ========== WEBSOCKET ==========
         function connectVoiceSocket() {
@@ -323,56 +318,98 @@
             };
 
             ws.onmessage = (event) => {
+                if (event.data instanceof Blob) {
+                    // Binary message: TTS audio chunk
+                    handleTTSAudioChunk(event.data);
+                    return;
+                }
+
                 const data = JSON.parse(event.data);
 
-                // Server says: start listening again
-                if (data.status === 'listen') {
-                    if (conversationMode && !isRecording) {
-                        startRecording();
+                // Status updates
+                if (data.status) {
+                    switch (data.status) {
+                        case 'listening':
+                            updateStatus('listening');
+                            break;
+                        case 'transcribing':
+                            updateStatus('processing');
+                            break;
+                        case 'thinking':
+                            updateStatus('thinking');
+                            break;
+                        case 'speaking':
+                            updateStatus('speaking');
+                            break;
+                        case 'idle':
+                            updateStatus('ready');
+                            break;
+                        case 'tts_audio':
+                            // TTS starting, prepare queue
+                            ttsAudioQueue = [];
+                            isPlayingTTS = true;
+                            break;
+                        case 'tts_done':
+                            // All TTS chunks received, play them
+                            playTTSAudioQueue();
+                            break;
                     }
                     return;
                 }
 
-                // Error from server
-                if (data.error) {
-                    if (data.error === 'No speech detected' || data.error.includes('too short')) {
-                        // Just restart listening silently
-                        if (conversationMode) {
-                            startRecording();
-                        }
-                    } else {
-                        addMessage(data.error, 'assistant');
-                    }
-                    return;
-                }
-
-                // Got a reply
+                // Conversation result
                 if (data.text !== undefined && data.reply !== undefined) {
+                    if (welcome) welcome.style.display = 'none';
                     if (data.text) {
-                        if (welcome) welcome.style.display = 'none';
                         addMessage(data.text, 'user');
+                        chatHistory.push({ role: 'user', content: data.text });
                     }
-
                     if (data.reply) {
                         addMessage(data.reply, 'assistant');
-                        chatHistory.push({ role: 'user', content: data.text });
                         chatHistory.push({ role: 'assistant', content: data.reply });
                         if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
-
-                        // Speak the reply, then auto-restart listening
-                        speakText(data.reply).then(() => {
-                            isSpeaking = false;
-                            if (conversationMode) {
-                                startRecording();
-                            }
-                        });
-                        isSpeaking = true;
                     }
+                }
+
+                // Errors
+                if (data.error) {
+                    console.log('Error:', data.error);
                 }
             };
         }
 
         connectVoiceSocket();
+
+        // ========== TTS AUDIO PLAYBACK ==========
+        function handleTTSAudioChunk(blob) {
+            ttsAudioQueue.push(blob);
+        }
+
+        async function playTTSAudioQueue() {
+            if (ttsAudioQueue.length === 0) return;
+
+            // Concatenate all chunks into one blob
+            const chunks = ttsAudioQueue;
+            ttsAudioQueue = [];
+
+            const fullBlob = new Blob(chunks, { type: 'audio/mpeg' });
+            const url = URL.createObjectURL(fullBlob);
+            const audio = new Audio(url);
+
+            await new Promise((resolve) => {
+                audio.onended = () => {
+                    URL.revokeObjectURL(url);
+                    resolve();
+                };
+                audio.onerror = () => {
+                    URL.revokeObjectURL(url);
+                    resolve();
+                };
+                audio.play();
+            });
+
+            isPlayingTTS = false;
+        }
 
         // Enable send button when text is entered
         textInput.addEventListener('input', () => {
@@ -489,11 +526,11 @@
             statusText.textContent = 'Ready';
         }
 
-        // ========== VOICE INPUT (WebSocket + Web Audio API) ==========
+        // ========== VOICE INPUT (backend owns the mic) ==========
         micBtn.addEventListener('click', toggleConversation);
 
         function toggleConversation() {
-            if (conversationMode) {
+            if (isConversationActive) {
                 stopConversation();
             } else {
                 startConversation();
@@ -506,117 +543,26 @@
                 return;
             }
 
-            conversationMode = true;
+            isConversationActive = true;
             micBtn.classList.add('recording');
             micBtn.innerHTML = '⏹️';
-            updateStatus('listening');
-            startRecording();
+
+            // Tell server to start listening
+            ws.send(JSON.stringify({ action: 'start' }));
         }
 
         function stopConversation() {
-            conversationMode = false;
-
-            // Stop any active recording
-            if (isRecording) {
-                stopRecording();
-            }
-
-            // Stop any playing audio
-            if (isSpeaking) {
-                window.speechSynthesis?.cancel();
-                isSpeaking = false;
-            }
-
+            isConversationActive = false;
             micBtn.classList.remove('recording');
             micBtn.innerHTML = '🎤';
-            updateStatus('ready');
-        }
 
-        async function startRecording() {
-            if (isRecording) return;
+            // Stop any playing TTS
+            isPlayingTTS = false;
 
-            try {
-                mediaStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        sampleRate: 16000,
-                        channelCount: 1,
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                    }
-                });
-
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-                const source = audioContext.createMediaStreamSource(mediaStream);
-
-                processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-                processor.onaudioprocess = (e) => {
-                    if (!isRecording) return;
-                    const inputData = e.inputBuffer.getChannelData(0);
-                    ws.send(inputData.buffer);
-                };
-
-                source.connect(processor);
-                processor.connect(audioContext.destination);
-
-                isRecording = true;
-                updateStatus('listening');
-
-            } catch (err) {
-                console.error('Microphone error:', err);
-                addMessage('Microphone access denied. Please allow microphone and try again.', 'assistant');
-                stopConversation();
+            // Tell server to stop
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ action: 'stop' }));
             }
-        }
-
-        function stopRecording() {
-            if (!isRecording) return;
-
-            isRecording = false;
-
-            if (processor) {
-                processor.disconnect();
-                processor = null;
-            }
-            if (audioContext) {
-                audioContext.close();
-                audioContext = null;
-            }
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(t => t.stop());
-                mediaStream = null;
-            }
-
-            updateStatus('processing');
-            ws.send('done');
-        }
-
-        // ========== TTS ==========
-        async function speakText(text) {
-            try {
-                const response = await fetch('/api/tts', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ text: text, lang: 'en' }),
-                });
-
-                if (response.ok) {
-                    const audioBlob = await response.blob();
-                    const audioUrl = URL.createObjectURL(audioBlob);
-                    return new Promise((resolve) => {
-                        const audio = new Audio(audioUrl);
-                        audio.onended = () => {
-                            URL.revokeObjectURL(audioUrl);
-                            resolve();
-                        };
-                        audio.onerror = () => resolve();
-                        audio.play();
-                    });
-                }
-            } catch (e) {
-                console.log('TTS failed, skipping audio');
-            }
-            return Promise.resolve();
         }
 
         // ========== HELPERS ==========
@@ -627,13 +573,17 @@
             switch (state) {
                 case 'ready':
                     dot.className = 'status-dot online';
-                    text.textContent = conversationMode ? 'Active — speak now' : 'Ready';
+                    text.textContent = isConversationActive ? 'Active — speak now' : 'Ready';
                     break;
                 case 'listening':
                     dot.className = 'status-dot online';
                     text.textContent = 'Listening...';
                     break;
                 case 'processing':
+                    dot.className = 'status-dot online';
+                    text.textContent = 'Transcribing...';
+                    break;
+                case 'thinking':
                     dot.className = 'status-dot online';
                     text.textContent = 'Thinking...';
                     break;

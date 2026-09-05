@@ -412,243 +412,398 @@ async def text_to_speech(request: Request):
 
 
 # ============================================================
-# WEBSOCKET: Real-time voice streaming
+# WEBSOCKET: Voice pipeline (backend owns the mic)
 # ============================================================
 
 
 @app.websocket("/ws/voice")
 async def websocket_voice(ws: WebSocket):
     """
-    WebSocket for real-time voice streaming.
+    Voice WebSocket — backend owns the microphone.
 
     Protocol:
-      - Client opens connection
-      - Client sends binary messages: raw float32 PCM samples
-        (16kHz, mono, 4-byte float32 per sample)
-      - Client sends text message "done" when utterance ends
-      - Server transcribes, runs RAG+LLM, sends JSON response
-      - Server sends {"status": "ready"} when ready for next utterance
+      - Browser sends {"action": "start"} → server starts
+        capturing mic, processing speech, speaking replies
+      - Browser sends {"action": "stop"} → server stops
+      - Server sends {"status": "..."} for UI state updates
+      - Server sends {"text": "...", "reply": "..."} for
+        each conversation turn
+      - Server sends binary chunks for TTS audio playback
     """
+
+    import io
+    import struct
+    import queue
+
+    import numpy as np
+    import sounddevice as sd
+    import soundfile as sf
+    import torch
+    import httpx
+    import edge_tts
 
     await ws.accept()
     print("🔌 Voice WebSocket connected")
 
-    import httpx
-    import numpy as np
+    # Load Silero VAD
+    vad_model, _ = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad",
+        model="silero_vad",
+    )
 
-    audio_chunks = []
+    # Config
+    SAMPLE_RATE = 16000
+    VAD_THRESHOLD = 0.5
+    SILENCE_PATIENCE_MS = 1200
+    VOLUME_SCALE = 0.1
+
+    audio_q = queue.Queue()
+    stop_evt = threading.Event()
+
+    def audio_callback(indata, frames, time_info, status):
+        audio_q.put(indata.copy())
+
+    # ---- send helpers (thread-safe) ----
+
+    async def send_json(data):
+        await ws.send_json(data)
+
+    async def send_status(status):
+        await send_json({"status": status})
+
+    async def send_result(text, reply, sources=None):
+        msg = {"text": text, "reply": reply}
+        if sources:
+            msg["sources"] = sources
+        await send_json(msg)
+
+    async def send_tts_audio(text, lang="en"):
+        """Generate TTS and send audio chunks."""
+        voice_map = {
+            "en": "en-IN-NeerjaExpressiveNeural",
+            "hi": "hi-IN-SwaraNeural",
+            "ta": "ta-IN-PallaviNeural",
+        }
+        voice = voice_map.get(lang, voice_map["en"])
+
+        try:
+            communicate = edge_tts.Communicate(text, voice)
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".mp3", delete=False
+            ) as tmp:
+                tmp_path = tmp.name
+
+            await communicate.save(tmp_path)
+
+            data, sr = sf.read(
+                tmp_path, dtype="float32"
+            )
+            os.remove(tmp_path)
+
+            # Convert to int16 PCM and send as chunks
+            int16 = (
+                np.clip(data * VOLUME_SCALE, -1.0, 1.0)
+                * 32767
+            ).astype(np.int16)
+
+            # Send header: audio info
+            await send_json({
+                "status": "tts_audio",
+                "sample_rate": sr,
+                "channels": 1,
+                "total_samples": len(int16),
+            })
+
+            # Send audio in chunks
+            chunk_size = sr  # 1 second per chunk
+            for i in range(0, len(int16), chunk_size):
+                chunk = int16[i : i + chunk_size]
+                await ws.send_bytes(chunk.tobytes())
+
+            # Signal end of audio
+            await send_json({"status": "tts_done"})
+
+        except Exception as e:
+            print(f"⚠️ TTS error: {e}")
+
+    # ---- background thread: audio pipeline ----
+
+    def voice_pipeline_thread():
+        """
+        Runs the voice loop in a background thread.
+        Same logic as chatbot.py but without wake word.
+        """
+
+        chunk_size = 512
+        chunks_per_second = SAMPLE_RATE / chunk_size
+        max_silence_chunks = int(
+            (SILENCE_PATIENCE_MS / 1000)
+            * chunks_per_second
+        )
+
+        chat_history = [
+            {"role": "system", "content": ""}
+        ]
+
+        try:
+
+            with sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=chunk_size,
+                callback=audio_callback,
+            ):
+
+                while not stop_evt.is_set():
+
+                    # ---- LISTEN for speech ----
+
+                    recorded = []
+                    triggered = False
+                    silence_counter = 0
+
+                    loop_start = time.time()
+
+                    while not stop_evt.is_set():
+
+                        try:
+                            chunk = audio_q.get(
+                                timeout=0.1
+                            )
+                        except queue.Empty:
+                            continue
+
+                        chunk = chunk.flatten()
+
+                        with torch.no_grad():
+                            speech_prob = vad_model(
+                                torch.from_numpy(chunk),
+                                SAMPLE_RATE,
+                            ).item()
+
+                        if speech_prob > VAD_THRESHOLD:
+                            if not triggered:
+                                triggered = True
+                                print(
+                                    "  ...speech started"
+                                )
+                            silence_counter = 0
+                        else:
+                            if triggered:
+                                silence_counter += 1
+
+                        if triggered:
+                            recorded.append(chunk)
+
+                            if (
+                                silence_counter
+                                > max_silence_chunks
+                            ):
+
+                                print(
+                                    "  ...speech finished"
+                                )
+
+                                utterance = (
+                                    np.concatenate(
+                                        recorded
+                                    )
+                                )
+
+                                # Run the full pipeline
+                                loop_start = time.time()
+                                asyncio.run(
+                                    process_utterance(
+                                        utterance,
+                                        chat_history,
+                                    )
+                                )
+                                loop_start = time.time()
+
+                                break
+
+                    # After processing, loop continues
+                    # to listen again automatically
+
+        except Exception as e:
+            print(f"⚠️ Voice pipeline error: {e}")
+
+        finally:
+            print("Voice pipeline thread stopped.")
+
+    async def process_utterance(
+        utterance, chat_history
+    ):
+        """Transcribe → RAG → LLM → TTS → speak."""
+
+        duration = len(utterance) / SAMPLE_RATE
+        print(f"🎤 Captured {duration:.1f}s of audio")
+
+        if duration < 0.3:
+            return  # too short, skip
+
+        # ---- Whisper transcription ----
+
+        await send_status("transcribing")
+
+        # Build WAV in memory
+        wav_buf = io.BytesIO()
+        int16 = (
+            np.clip(utterance, -1.0, 1.0) * 32767
+        ).astype(np.int16)
+
+        data_size = len(int16) * 2
+        wav_buf.write(b"RIFF")
+        wav_buf.write(
+            struct.pack("<I", 36 + data_size)
+        )
+        wav_buf.write(b"WAVE")
+        wav_buf.write(b"fmt ")
+        wav_buf.write(struct.pack("<I", 16))
+        wav_buf.write(
+            struct.pack(
+                "<HHIIHH",
+                1, 1, SAMPLE_RATE,
+                SAMPLE_RATE * 2, 2, 16,
+            )
+        )
+        wav_buf.write(b"data")
+        wav_buf.write(struct.pack("<I", data_size))
+        wav_buf.write(int16.tobytes())
+        wav_buf.seek(0)
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=300.0
+            ) as client:
+                resp = await client.post(
+                    WHISPER_SERVER_URL,
+                    files={
+                        "file": (
+                            "audio.wav",
+                            wav_buf,
+                            "audio/wav",
+                        ),
+                    },
+                    data={
+                        "response_format": (
+                            "verbose_json"
+                        ),
+                        "temperature": "0.0",
+                    },
+                )
+                resp.raise_for_status()
+                result = resp.json()
+        except Exception as e:
+            print(f"⚠️ Whisper error: {e}")
+            return
+
+        text = result.get("text", "").strip()
+
+        if not text:
+            print("No speech detected.")
+            return
+
+        print(f"📝 Transcribed: {text}")
+
+        # ---- RAG retrieval ----
+
+        await send_status("thinking")
+
+        llm = get_llm()
+        retriever = get_retriever()
+
+        rag_context = None
+        sources = []
+        try:
+            rag_context, sources = (
+                retriever.get_context(text)
+            )
+            if rag_context:
+                print(
+                    f"📚 RAG: {len(sources)} chunks"
+                )
+        except Exception as e:
+            print(f"⚠️ RAG error: {e}")
+
+        # ---- LLM response ----
+
+        user_message = (
+            "[This request is in English. "
+            "Respond in the same language "
+            "as the user.]\n\n"
+            f"{text}"
+        )
+
+        reply = ""
+
+        for chunk in llm.generate_response(
+            user_text=user_message,
+            chat_history=chat_history,
+            stream=True,
+            rag_context=rag_context,
+        ):
+            reply += chunk
+
+        print(f"🤖 Reply: {reply[:100]}")
+
+        # Send text result to browser
+        await send_result(text, reply, sources)
+
+        # ---- TTS → play in browser ----
+
+        await send_status("speaking")
+        await send_tts_audio(reply)
+
+        # Done speaking, ready for next utterance
+        await send_status("listening")
+
+    # ---- main WebSocket handler ----
+
+    pipeline_thread = None
 
     try:
+
         while True:
             msg = await ws.receive()
 
-            if msg.get("type") == "websocket.receive":
+            if msg.get("type") != "websocket.receive":
+                continue
 
-                # Binary message: raw PCM audio chunk
-                if msg.get("bytes"):
-                    audio_chunks.append(msg["bytes"])
+            if msg.get("text"):
+                data = json.loads(msg["text"])
+                action = data.get("action")
 
-                # Text message: control commands
-                elif msg.get("text"):
+                if action == "start":
+                    if (
+                        pipeline_thread
+                        and pipeline_thread.is_alive()
+                    ):
+                        continue
 
-                    text = msg["text"].strip()
+                    stop_evt.clear()
+                    pipeline_thread = threading.Thread(
+                        target=voice_pipeline_thread,
+                        daemon=True,
+                    )
+                    pipeline_thread.start()
+                    await send_status("listening")
 
-                    if text == "done":
-                        # Process the complete utterance
-                        if not audio_chunks:
-                            await ws.send_json(
-                                {"error": "No audio captured"}
-                            )
-                            continue
-
-                        # Concatenate all chunks into one buffer
-                        full_audio = b"".join(audio_chunks)
-                        audio_chunks = []
-
-                        # Convert float32 PCM to WAV
-                        samples = np.frombuffer(
-                            full_audio, dtype=np.float32
-                        )
-
-                        duration = (
-                            len(samples) / 16000
-                        )
-                        print(
-                            f"🎤 Captured {duration:.1f}s "
-                            f"of audio"
-                        )
-
-                        if duration < 0.3:
-                            await ws.send_json(
-                                {
-                                    "error": (
-                                        "Audio too short. "
-                                        "Speak for at least "
-                                        "1 second."
-                                    )
-                                }
-                            )
-                            continue
-
-                        # Build WAV in memory
-                        import struct
-                        import io
-
-                        wav_buf = io.BytesIO()
-                        int16 = (
-                            np.clip(samples, -1.0, 1.0)
-                            * 32767
-                        ).astype(np.int16)
-
-                        # WAV header
-                        data_size = len(int16) * 2
-                        wav_buf.write(b"RIFF")
-                        wav_buf.write(
-                            struct.pack(
-                                "<I",
-                                36 + data_size,
-                            )
-                        )
-                        wav_buf.write(b"WAVE")
-                        wav_buf.write(b"fmt ")
-                        wav_buf.write(
-                            struct.pack("<I", 16)
-                        )
-                        wav_buf.write(
-                            struct.pack(
-                                "<HHIIHH",
-                                1, 1, 16000,
-                                32000, 2, 16,
-                            )
-                        )
-                        wav_buf.write(b"data")
-                        wav_buf.write(
-                            struct.pack("<I", data_size)
-                        )
-                        wav_buf.write(int16.tobytes())
-                        wav_buf.seek(0)
-
-                        # Send to whisper
-                        try:
-                            async with httpx.AsyncClient(
-                                timeout=300.0
-                            ) as client:
-                                resp = await client.post(
-                                    WHISPER_SERVER_URL,
-                                    files={
-                                        "file": (
-                                            "audio.wav",
-                                            wav_buf,
-                                            "audio/wav",
-                                        ),
-                                    },
-                                    data={
-                                        "response_format": (
-                                            "verbose_json"
-                                        ),
-                                        "temperature": (
-                                            "0.0"
-                                        ),
-                                    },
-                                )
-                                resp.raise_for_status()
-                                result = resp.json()
-                        except Exception as e:
-                            await ws.send_json(
-                                {
-                                    "error": (
-                                        f"Whisper error: {e}"
-                                    )
-                                }
-                            )
-                            continue
-
-                        transcription = result.get(
-                            "text", ""
-                        ).strip()
-
-                        if not transcription:
-                            await ws.send_json(
-                                {
-                                    "text": "",
-                                    "reply": "",
-                                    "error": (
-                                        "No speech detected"
-                                    ),
-                                }
-                            )
-                            continue
-
-                        print(
-                            f"📝 Transcribed: "
-                            f"{transcription}"
-                        )
-
-                        # RAG retrieval
-                        llm = get_llm()
-                        retriever = get_retriever()
-
-                        rag_context = None
-                        sources = []
-                        try:
-                            rag_context, sources = (
-                                retriever.get_context(
-                                    transcription
-                                )
-                            )
-                        except Exception as e:
-                            print(f"⚠️ RAG error: {e}")
-
-                        # LLM response
-                        chat_history = [
-                            {
-                                "role": "system",
-                                "content": "",
-                            }
-                        ]
-
-                        user_message = (
-                            "[This request is in English. "
-                            "Respond in the same language "
-                            "as the user.]\n\n"
-                            f"{transcription}"
-                        )
-
-                        reply = ""
-
-                        for chunk in llm.generate_response(
-                            user_text=user_message,
-                            chat_history=chat_history,
-                            stream=True,
-                            rag_context=rag_context,
-                        ):
-                            reply += chunk
-
-                        print(f"🤖 Reply: {reply[:100]}")
-
-                        # Send response
-                        await ws.send_json(
-                            {
-                                "text": transcription,
-                                "reply": reply,
-                                "sources": sources,
-                            }
-                        )
-
-                        # Signal client to start listening again
-                        await ws.send_json(
-                            {"status": "listen"}
-                        )
-
-                    elif text == "ping":
-                        await ws.send_json(
-                            {"status": "ready"}
-                        )
+                elif action == "stop":
+                    stop_evt.set()
+                    if pipeline_thread:
+                        pipeline_thread.join(timeout=2.0)
+                    pipeline_thread = None
+                    await send_status("idle")
 
     except WebSocketDisconnect:
         print("🔌 Voice WebSocket disconnected")
+        stop_evt.set()
     except Exception as e:
         print(f"⚠️ WebSocket error: {e}")
+        stop_evt.set()
 
 
 # ============================================================
