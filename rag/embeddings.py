@@ -43,7 +43,7 @@ class EmbeddingModel:
 
         self.model = AutoModel.from_pretrained(
             path,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             trust_remote_code=True,
         )
 

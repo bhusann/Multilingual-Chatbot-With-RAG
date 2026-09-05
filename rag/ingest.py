@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 
 # PDF extraction
-import fitz  # PyMuPDF
+import pymupdf
 
 from rag.chunker import chunk_text
 from rag.embeddings import get_embedding_model
@@ -38,7 +38,7 @@ def extract_text_from_pdf(filepath):
     Returns list of dicts with 'text' and 'page' keys.
     """
 
-    doc = fitz.open(filepath)
+    doc = pymupdf.open(filepath)
 
     pages = []
 
