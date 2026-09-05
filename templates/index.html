@@ -519,9 +519,6 @@
                     chatHistory = chatHistory.slice(-20);
                 }
 
-                // Speak the reply
-                if (replyText) speakText(replyText);
-
             } catch (error) {
                 typingEl.remove();
                 addMessage('Sorry, something went wrong. Please try again.', 'assistant');

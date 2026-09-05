@@ -436,12 +436,6 @@
         });
 
         async function uploadFile(file) {
-            const ext = file.name.split('.').pop().toLowerCase();
-            if (!['pdf', 'txt'].includes(ext)) {
-                showToast('Only PDF and TXT files are supported');
-                return;
-            }
-
             uploadZone.innerHTML = `
                 <div class="icon"><span class="spinner"></span></div>
                 <p><strong>Uploading ${escapeHtml(file.name)}...</strong></p>
