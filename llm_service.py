@@ -157,6 +157,36 @@ WEB_SEARCH_TOOL = {
     },
 }
 
+RAG_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "rag_search",
+        "description": (
+            "Search the uploaded government scheme documents. "
+            "Use this to find specific details from the user's "
+            "uploaded documents — eligibility, amounts, steps, "
+            "deadlines, etc. The query MUST be in English keywords "
+            "(the embedding model handles multilingual matching). "
+            "You may call it multiple times with different keyword "
+            "queries to cover different aspects of the question."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "English keyword query for document search. "
+                        "Extract key terms from the user's question "
+                        "and translate to English if needed."
+                    ),
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
+
 
 # ============================================================
 # LLM SERVICE
@@ -248,6 +278,63 @@ class LLMService:
             f"{base_url}"
         )
 
+    # ------------------------------------------------
+    # RAG search (called as a tool by the LLM)
+    # ------------------------------------------------
+
+    def rag_search(self, query):
+        """
+        Search uploaded documents using English keywords.
+        The retriever handles embedding + Chroma lookup.
+        Returns formatted context string for the LLM.
+        """
+        from rag.retriever import Retriever
+
+        try:
+            retriever = Retriever()
+            context, sources = retriever.get_context(query)
+
+            if not context:
+                return (
+                    "No relevant documents found for "
+                    f"'{query}'. Use web_search instead."
+                )
+
+            n = len(sources)
+            print(
+                f"📚 RAG tool: {n} chunks for '{query}'"
+            )
+            return context
+
+        except Exception as e:
+            print(f"⚠️ RAG tool error: {e}")
+            return (
+                f"RAG search failed: {e}. "
+                "Use web_search instead."
+            )
+
+    def _dispatch_tool(self, tool_name, query, user_text):
+        """Dispatch a single tool call to the right handler."""
+        if tool_name == "web_search":
+            return self.search_engine.search(query)
+        elif tool_name == "rag_search":
+            return self.rag_search(query)
+        else:
+            print(f"⚠️ Unknown tool: {tool_name}")
+            return []
+
+    def _format_tool_result(self, tool_name, raw_result):
+        """Format raw tool result for the LLM message."""
+        if tool_name == "web_search":
+            return self.search_engine.format_results(
+                raw_result
+            )
+        elif tool_name == "rag_search":
+            # rag_search already returns formatted string
+            return raw_result
+        else:
+            return str(raw_result)
+
     def _build_system_prompt(self):
         """Build the system prompt once at startup."""
 
@@ -258,29 +345,46 @@ TODAY'S DATE: {self.today_date}
 SEARCH AGENT BEHAVIOUR
 ======================
 
-You are a research agent with a `web_search` tool.
+You are a research agent with TWO tools: `web_search` and `rag_search`.
 
+TOOLS
+-----
+- `web_search(query)` — Search the internet for fresh facts.
+  Query MUST be in ENGLISH. Include the current year ({self.current_year}).
+- `rag_search(query)` — Search uploaded government scheme documents.
+  Query MUST be in ENGLISH keywords (the embedding model handles
+  multilingual matching). Use this for specific scheme details,
+  eligibility, amounts, application steps from uploaded docs.
+
+PARALLEL TOOL CALLS
+-------------------
+- You can call BOTH tools in the same round (parallel).
+  For example: rag_search("maize subsidy eligibility") AND
+  web_search("Tamil Nadu maize scheme 2026") simultaneously.
+- Use rag_search FIRST to check uploaded docs, then web_search
+  for latest补充 info. Or call both at once.
+
+LANGUAGE RULES
+--------------
 - The user may speak ANY language, including Tanglish / Hinglish
   (Indian languages written in Latin script).
 - First UNDERSTAND the user's intent in their own language.
 - Then TRANSLATE the intent into precise ENGLISH search queries.
-- IMPORTANT: ALWAYS search for the LATEST data. Include the current
-  year ({self.current_year}) in your search queries (for example
-  "... {self.current_year} ..." or "... {self.current_year} latest ...").
-  Prefer results dated in {self.current_year} or the most recent year
-  available. Reject stale information if newer results contradict it.
-- Call `web_search` as many times as needed to cover every part of
+- The user message includes a language tag indicating which language
+  to respond in. Follow that instruction.
+
+SEARCH STRATEGY
+---------------
+- ALWAYS search for the LATEST data. Include the current year
+  ({self.current_year}) in web_search queries.
+- Call tools as many times as needed to cover every part of
   the question. For multi-part questions, search each part separately.
 - If the first results are thin, refine the query and search again.
-- Once you have enough information, write the final answer.
+- Combine rag_search results (from docs) with web_search results
+  (from internet) to give a complete answer.
 
 FINAL ANSWER RULES
 ==================
-
-- The user message includes a language tag indicating which language
-  to respond in. Follow that instruction.
-- If the user has explicitly asked to speak in a different language
-  earlier in the conversation, follow that instruction instead.
 - Keep the answer concise and conversational (2-4 short sentences)
   because it will be read aloud by a text-to-speech engine.
 - Mention key facts like amounts, eligibility, age limits and
@@ -302,15 +406,6 @@ FINAL ANSWER RULES
         messages = [
             {"role": "system", "content": system_prompt},
         ]
-
-        # Inject RAG context if available
-        if rag_context:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": rag_context,
-                }
-            )
 
         # Prior multi-turn context (user/assistant pairs)
         messages.extend(prior_turns)
@@ -338,7 +433,7 @@ FINAL ANSWER RULES
                 .create(
                     model=self.model,
                     messages=messages,
-                    tools=[WEB_SEARCH_TOOL],
+                    tools=[WEB_SEARCH_TOOL, RAG_SEARCH_TOOL],
                     tool_choice="auto",
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
@@ -368,16 +463,16 @@ FINAL ANSWER RULES
                         "role": "user",
                         "content": (
                             "You returned an empty reply. Please answer the "
-                            "user's question now. Use the web_search tool if "
-                            "you need more information, then give your final "
-                            "answer in the user's language."
+                            "user's question now. Use web_search or rag_search "
+                            "tools if you need more information, then give your "
+                            "final answer in the user's language."
                         ),
                     }
                 )
 
                 continue
 
-            # Execute each requested search and feed results back
+            # Execute each requested tool and feed results back
             messages.append(
                 {
                     "role": "assistant",
@@ -415,13 +510,15 @@ FINAL ANSWER RULES
 
                 jobs.append((tc, query))
 
+            tool_names = [tc.function.name for tc in tool_calls]
             print(
-                f"🔎 Searching x{len(jobs)} (parallel): "
-                + " | ".join(q for _, q in jobs)
+                f"🔧 Tools x{len(jobs)} (parallel): "
+                + " | ".join(
+                    f"{name}({q})" for name, (_, q) in zip(tool_names, jobs)
+                )
             )
 
-            # Run all searches for this round concurrently.
-            # Slowest single search now bounds the round, not the sum.
+            # Run all tool calls for this round concurrently.
             # Results are stashed and appended in the ORIGINAL tool-call
             # order so tool messages always line up with tool_calls.
             ordered_results = [None] * len(jobs)
@@ -436,10 +533,11 @@ FINAL ANSWER RULES
                 future_by_index = {}
 
                 for index, (tc, query) in enumerate(jobs):
-
                     future_by_index[index] = pool.submit(
-                        self.search_engine.search,
+                        self._dispatch_tool,
+                        tc.function.name,
                         query,
+                        user_text,
                     )
 
                 for index, future in future_by_index.items():
@@ -450,19 +548,20 @@ FINAL ANSWER RULES
 
                     except Exception as e:
 
-                        print(f"⚠️ Search failed: {e}")
+                        print(f"⚠️ Tool failed: {e}")
 
                         ordered_results[index] = []
 
             for index, (tc, query) in enumerate(jobs):
-
+                raw = ordered_results[index] or []
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": (
-                            self.search_engine.format_results(
-                                ordered_results[index]
+                            self._format_tool_result(
+                                tc.function.name,
+                                raw,
                             )
                         ),
                     }
@@ -481,15 +580,6 @@ FINAL ANSWER RULES
         messages = [
             {"role": "system", "content": system_prompt},
         ]
-
-        # Inject RAG context if available
-        if rag_context:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": rag_context,
-                }
-            )
 
         messages.extend(prior_turns)
 
@@ -516,7 +606,7 @@ FINAL ANSWER RULES
                 .create(
                     model=self.model,
                     messages=messages,
-                    tools=[WEB_SEARCH_TOOL],
+                    tools=[WEB_SEARCH_TOOL, RAG_SEARCH_TOOL],
                     tool_choice="auto",
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
@@ -594,7 +684,7 @@ FINAL ANSWER RULES
                     }
                 )
 
-                # Execute searches
+                # Execute tools in parallel
                 jobs = []
 
                 for tc_raw in assistant_tool_calls:
@@ -609,9 +699,12 @@ FINAL ANSWER RULES
 
                     jobs.append((tc_raw, query))
 
+                tool_names = [tc["function"]["name"] for tc in assistant_tool_calls]
                 print(
-                    f"🔎 Searching x{len(jobs)} (parallel): "
-                    + " | ".join(q for _, q in jobs)
+                    f"🔧 Tools x{len(jobs)} (parallel): "
+                    + " | ".join(
+                        f"{name}({q})" for name, (_, q) in zip(tool_names, jobs)
+                    )
                 )
 
                 ordered_results = [None] * len(jobs)
@@ -627,25 +720,29 @@ FINAL ANSWER RULES
 
                     for index, (tc_raw, query) in enumerate(jobs):
                         future_by_index[index] = pool.submit(
-                            self.search_engine.search,
+                            self._dispatch_tool,
+                            tc_raw["function"]["name"],
                             query,
+                            user_text,
                         )
 
                     for index, future in future_by_index.items():
                         try:
                             ordered_results[index] = future.result()
                         except Exception as e:
-                            print(f"⚠️ Search failed: {e}")
+                            print(f"⚠️ Tool failed: {e}")
                             ordered_results[index] = []
 
                 for index, (tc_raw, query) in enumerate(jobs):
+                    raw = ordered_results[index] or []
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tc_raw["id"],
                             "content": (
-                                self.search_engine.format_results(
-                                    ordered_results[index]
+                                self._format_tool_result(
+                                    tc_raw["function"]["name"],
+                                    raw,
                                 )
                             ),
                         }

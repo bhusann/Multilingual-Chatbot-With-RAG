@@ -184,14 +184,6 @@ async def chat(request: Request):
         )
 
     llm = get_llm()
-    retriever = get_retriever()
-
-    # RAG retrieval
-    rag_context = None
-    try:
-        rag_context, _ = retriever.get_context(user_text)
-    except Exception as e:
-        print(f"⚠️ RAG error: {e}")
 
     # Build chat history for the LLM
     chat_history = [{"role": "system", "content": ""}]
@@ -211,32 +203,11 @@ async def chat(request: Request):
             user_text=user_message,
             chat_history=chat_history,
             stream=True,
-            rag_context=rag_context,
         ):
             full_reply += chunk
             yield f"data: {json.dumps({'text': chunk})}\n\n"
 
-        # Send sources if available
-        if rag_context:
-            try:
-                _, sources = retriever.get_context(
-                    user_text
-                )
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {"sources": sources}
-                    )
-                    + "\n\n"
-                )
-            except Exception:
-                pass
-
-        yield (
-            "data: "
-            + json.dumps({"done": True})
-            + "\n\n"
-        )
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -314,18 +285,8 @@ async def voice_input(
             }
         )
 
-    # RAG + LLM
+    # LLM (tools: web_search + rag_search)
     llm = get_llm()
-    retriever = get_retriever()
-
-    rag_context = None
-    try:
-        rag_context, sources = retriever.get_context(
-            text
-        )
-    except Exception as e:
-        print(f"⚠️ RAG error: {e}")
-        sources = []
 
     chat_history = [{"role": "system", "content": ""}]
 
@@ -341,7 +302,6 @@ async def voice_input(
         user_text=user_message,
         chat_history=chat_history,
         stream=True,
-        rag_context=rag_context,
     ):
         reply += chunk
 
@@ -349,7 +309,6 @@ async def voice_input(
         {
             "text": text,
             "reply": reply,
-            "sources": sources,
         }
     )
 
@@ -755,27 +714,11 @@ async def websocket_voice(ws: WebSocket):
 
         print(f"📝 Transcribed: {text}")
 
-        # ---- RAG retrieval ----
+        # ---- LLM response (tools: web_search + rag_search) ----
 
         await send_status("thinking")
 
         llm = get_llm()
-        retriever = get_retriever()
-
-        rag_context = None
-        sources = []
-        try:
-            rag_context, sources = (
-                retriever.get_context(text)
-            )
-            if rag_context:
-                print(
-                    f"📚 RAG: {len(sources)} chunks"
-                )
-        except Exception as e:
-            print(f"⚠️ RAG error: {e}")
-
-        # ---- LLM response ----
 
         user_message = (
             "[This request is in English. "
@@ -790,14 +733,13 @@ async def websocket_voice(ws: WebSocket):
             user_text=user_message,
             chat_history=chat_history,
             stream=True,
-            rag_context=rag_context,
         ):
             reply += chunk
 
         print(f"🤖 Reply: {reply[:100]}")
 
         # Send text result to browser
-        await send_result(text, reply, sources)
+        await send_result(text, reply)
 
         # ---- TTS → play in browser ----
 
