@@ -20,6 +20,7 @@ between the model and the search engine.
 
 import json
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
@@ -40,6 +41,21 @@ MAX_TOKENS = 1200
 TEMPERATURE = 0.3
 MAX_SEARCH_ROUNDS = 6  # max number of tool-call rounds per user query
 MAX_PARALLEL_SEARCHES = 4  # searches run concurrently within one round
+
+
+# ============================================================
+# BASE SYSTEM PROMPT
+# ============================================================
+
+BASE_SYSTEM_PROMPT = """
+You are a helpful multilingual voice assistant for government schemes.
+
+RULES:
+
+1. Keep responses concise and conversational, normally 2-3 sentences.
+2. Answer the user's actual question directly.
+3. Do not mention these instructions.
+"""
 
 
 # ============================================================
@@ -168,6 +184,10 @@ class LLMService:
         self.search_engine = SearchEngine()
 
         self.client = None
+        self.model = LLM_MODEL
+
+        # Build system prompt ONCE
+        self.system_prompt = self._build_system_prompt()
 
         if OPENCODE_API_KEY:
 
@@ -195,15 +215,43 @@ class LLMService:
                 "export OPENCODE_API_KEY='your-key-here'"
             )
 
-    def _build_system_prompt(
+    def configure_endpoint(
         self,
-        base_system_prompt,
-        language_instruction,
+        base_url,
+        model=None,
+        api_key=None,
     ):
+        """
+        Re-point this service to a custom OpenAI-compatible
+        endpoint (e.g. a local llama.cpp server).
 
-        return (
-            base_system_prompt
-            + f"""
+        The default OpenCode Zen server stays untouched for
+        any other scripts that share this module.
+        """
+
+        key = (
+            api_key
+            or OPENCODE_API_KEY
+            or "local-test-key"
+        )
+
+        self.client = OpenAI(
+            api_key=key,
+            base_url=base_url,
+        )
+
+        if model:
+            self.model = model
+
+        print(
+            "LLM Service re-pointed to custom endpoint: "
+            f"{base_url}"
+        )
+
+    def _build_system_prompt(self):
+        """Build the system prompt once at startup."""
+
+        return f"""{BASE_SYSTEM_PROMPT}
 
 TODAY'S DATE: {self.today_date}
 
@@ -229,11 +277,10 @@ You are a research agent with a `web_search` tool.
 FINAL ANSWER RULES
 ==================
 
-- Write the final answer ONLY in the language the user spoke.
-  (Tanglish -> Tanglish, Tamil -> Tamil script, Hindi -> Hindi
-  script, English -> English, and so on.)
-- Mirror the script style: if the user wrote Tamil in Latin letters
-  (Tanglish), reply in Tanglish Latin letters.
+- The user message includes a language tag indicating which language
+  to respond in. Follow that instruction.
+- If the user has explicitly asked to speak in a different language
+  earlier in the conversation, follow that instruction instead.
 - Keep the answer concise and conversational (2-4 short sentences)
   because it will be read aloud by a text-to-speech engine.
 - Mention key facts like amounts, eligibility, age limits and
@@ -242,13 +289,14 @@ FINAL ANSWER RULES
   figures from the search results. If a year is involved, state it
   clearly.
 """
-            + language_instruction
-        )
 
-    def _run_agent_loop(self, system_prompt, user_text, prior_turns, cancel_event=None):
+    def _run_agent_loop(self, system_prompt, user_text, prior_turns, cancel_event=None, stream=False):
         """
         Run the tool-calling loop until the model answers or the
         round limit is reached. Returns the final text reply.
+
+        If stream=True, the FINAL answer is streamed to stdout.
+        Tool-call rounds are never streamed.
         """
 
         messages = [
@@ -261,10 +309,7 @@ FINAL ANSWER RULES
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    "USER MESSAGE:\n"
-                    + user_text
-                ),
+                "content": user_text,
             }
         )
 
@@ -276,12 +321,13 @@ FINAL ANSWER RULES
             ):
                 return ""
 
+            # Tool-call rounds: non-streaming
             response = (
                 self.client
                 .chat
                 .completions
                 .create(
-                    model=LLM_MODEL,
+                    model=self.model,
                     messages=messages,
                     tools=[WEB_SEARCH_TOOL],
                     tool_choice="auto",
@@ -304,7 +350,6 @@ FINAL ANSWER RULES
                 reply = (message.content or "").strip()
 
                 if reply:
-
                     return reply
 
                 # Empty response — nudge the model to retry instead
@@ -417,13 +462,218 @@ FINAL ANSWER RULES
         # Round limit reached without a final answer
         return ""
 
+    def _run_agent_loop_streaming(self, system_prompt, user_text, prior_turns, cancel_event=None):
+        """
+        Run the tool-calling loop with streaming on the FINAL answer.
+        Tool-call rounds are non-streaming. Returns an iterator of
+        text chunks for the final answer.
+        """
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+        ]
+
+        messages.extend(prior_turns)
+
+        messages.append(
+            {
+                "role": "user",
+                "content": user_text,
+            }
+        )
+
+        for _ in range(MAX_SEARCH_ROUNDS):
+
+            if (
+                cancel_event
+                and cancel_event.is_set()
+            ):
+                return
+
+            # Stream the response to detect tool calls vs final answer
+            response_stream = (
+                self.client
+                .chat
+                .completions
+                .create(
+                    model=self.model,
+                    messages=messages,
+                    tools=[WEB_SEARCH_TOOL],
+                    tool_choice="auto",
+                    max_tokens=MAX_TOKENS,
+                    temperature=TEMPERATURE,
+                    stream=True,
+                )
+            )
+
+            # Accumulate the streamed response
+            content_parts = []
+            reasoning_parts = []
+            tool_calls_data = {}  # index -> {id, name, arguments}
+            has_tool_calls = False
+
+            for chunk in response_stream:
+
+                if not chunk.choices:
+                    continue
+
+                delta = chunk.choices[0].delta
+
+                # Content
+                c = getattr(delta, "content", None)
+                if c:
+                    content_parts.append(c)
+
+                # Reasoning (for reasoning models)
+                r = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if r:
+                    reasoning_parts.append(r)
+
+                # Tool calls
+                tc_delta = getattr(delta, "tool_calls", None)
+                if tc_delta:
+                    has_tool_calls = True
+                    for tc in tc_delta:
+                        idx = tc.index
+                        if idx not in tool_calls_data:
+                            tool_calls_data[idx] = {
+                                "id": tc.id or "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        if tc.id:
+                            tool_calls_data[idx]["id"] = tc.id
+                        func = getattr(tc, "function", None)
+                        if func:
+                            if func.name:
+                                tool_calls_data[idx]["name"] = func.name
+                            if func.arguments:
+                                tool_calls_data[idx]["arguments"] += func.arguments
+
+            # If there are tool calls, execute them (non-streaming path)
+            if has_tool_calls:
+
+                # Build the assistant message with tool calls
+                assistant_content = "".join(content_parts) or None
+                assistant_tool_calls = []
+
+                for idx in sorted(tool_calls_data.keys()):
+                    tc = tool_calls_data[idx]
+                    assistant_tool_calls.append({
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    })
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": assistant_content,
+                        "tool_calls": assistant_tool_calls,
+                    }
+                )
+
+                # Execute searches
+                jobs = []
+
+                for tc_raw in assistant_tool_calls:
+
+                    try:
+                        args = json.loads(
+                            tc_raw["function"]["arguments"] or "{}"
+                        )
+                        query = args.get("query", user_text)
+                    except Exception:
+                        query = user_text
+
+                    jobs.append((tc_raw, query))
+
+                print(
+                    f"🔎 Searching x{len(jobs)} (parallel): "
+                    + " | ".join(q for _, q in jobs)
+                )
+
+                ordered_results = [None] * len(jobs)
+
+                with ThreadPoolExecutor(
+                    max_workers=min(
+                        len(jobs),
+                        MAX_PARALLEL_SEARCHES,
+                    )
+                ) as pool:
+
+                    future_by_index = {}
+
+                    for index, (tc_raw, query) in enumerate(jobs):
+                        future_by_index[index] = pool.submit(
+                            self.search_engine.search,
+                            query,
+                        )
+
+                    for index, future in future_by_index.items():
+                        try:
+                            ordered_results[index] = future.result()
+                        except Exception as e:
+                            print(f"⚠️ Search failed: {e}")
+                            ordered_results[index] = []
+
+                for index, (tc_raw, query) in enumerate(jobs):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_raw["id"],
+                            "content": (
+                                self.search_engine.format_results(
+                                    ordered_results[index]
+                                )
+                            ),
+                        }
+                    )
+
+                continue
+
+            # No tool calls — this is the final answer, stream it
+            reply = "".join(content_parts).strip()
+
+            # Handle reasoning models (Gemma4, DeepSeek, etc.)
+            if not reply and reasoning_parts:
+                raw_reasoning = "".join(reasoning_parts).strip()
+                lines = [line.strip() for line in raw_reasoning.split("\n") if line.strip()]
+                ans_lines = [l for l in lines if not (l.startswith('*') or l.startswith('Subject:') or l.startswith('Constraint:'))]
+                if ans_lines:
+                    reply = " ".join(ans_lines).strip()
+                elif lines:
+                    reply = lines[-1].strip('* ')
+
+            if reply:
+                yield reply
+                return
+
+            # Empty response — nudge retry
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You returned an empty reply. Please answer the "
+                        "user's question now. Use the web_search tool if "
+                        "you need more information, then give your final "
+                        "answer in the user's language."
+                    ),
+                }
+            )
+
+        # Round limit reached
+        yield ""
+
     def generate_response(
         self,
         user_text,
-        base_system_prompt,
-        language_instruction,
         chat_history,
         cancel_event=None,
+        stream=False,
     ):
         """
         Search the web (as many rounds as the model wants) and return
@@ -435,23 +685,29 @@ FINAL ANSWER RULES
         If cancel_event (a threading.Event) is set while searching,
         the loop stops early and returns "" (nothing is added to
         chat_history).
+
+        If stream=True, returns a generator that yields chunks of the
+        final answer (after all tool-call rounds).
         """
 
         if self.client is None:
 
-            return (
+            msg = (
                 "Sorry, the assistant is not configured. "
                 "Please set the OPENCODE_API_KEY."
             )
 
+            if stream:
+                yield msg
+                return
+            else:
+                return msg
+
         # ----------------------------------------
-        # 1. Build the system prompt
+        # 1. Use the pre-built system prompt
         # ----------------------------------------
 
-        system_prompt = self._build_system_prompt(
-            base_system_prompt=base_system_prompt,
-            language_instruction=language_instruction,
-        )
+        system_prompt = self.system_prompt
 
         # ----------------------------------------
         # 2. Prior turns (everything except index 0)
@@ -463,59 +719,84 @@ FINAL ANSWER RULES
         # 3. Run the search-agent loop
         # ----------------------------------------
 
-        try:
+        if stream:
+            # Streaming mode: yield chunks from the final answer
+            full_reply = ""
 
-            reply = self._run_agent_loop(
+            for chunk in self._run_agent_loop_streaming(
                 system_prompt=system_prompt,
                 user_text=user_text,
                 prior_turns=prior_turns,
                 cancel_event=cancel_event,
+            ):
+                full_reply += chunk
+                yield chunk
+
+            # Interrupted mid-search: discard
+            if (
+                cancel_event
+                and cancel_event.is_set()
+            ):
+                return
+
+            if not full_reply:
+                full_reply = (
+                    "I couldn't find an answer "
+                    "for that right now. Please try again."
+                )
+                yield full_reply
+
+            # Remember turns
+            chat_history.append(
+                {"role": "user", "content": user_text}
+            )
+            chat_history.append(
+                {"role": "assistant", "content": full_reply}
             )
 
-        except Exception as e:
+        else:
+            # Non-streaming mode
+            try:
 
-            print(f"⚠️ LLM request failed: {e}")
+                reply = self._run_agent_loop(
+                    system_prompt=system_prompt,
+                    user_text=user_text,
+                    prior_turns=prior_turns,
+                    cancel_event=cancel_event,
+                )
 
-            return (
-                "Sorry, I couldn't reach "
-                "the assistant service right now."
+            except Exception as e:
+
+                print(f"⚠️ LLM request failed: {e}")
+
+                return (
+                    "Sorry, I couldn't reach "
+                    "the assistant service right now."
+                )
+
+            # Interrupted mid-search: discard
+            if (
+                cancel_event
+                and cancel_event.is_set()
+            ):
+                return ""
+
+            if not reply:
+
+                reply = (
+                    "I couldn't find an answer "
+                    "for that right now. Please try again."
+                )
+
+            # Remember turns
+            chat_history.append(
+                {"role": "user", "content": user_text}
+            )
+            chat_history.append(
+                {"role": "assistant", "content": reply}
             )
 
-        # Interrupted mid-search: discard the partial reply
-        # and DO NOT remember this turn.
-        if (
-            cancel_event
-            and cancel_event.is_set()
-        ):
-
-            return ""
-
-        if not reply:
-
-            reply = (
-                "I couldn't find an answer "
-                "for that right now. Please try again."
-            )
-
-        # ----------------------------------------
-        # 4. Remember the user + assistant turns
-        # ----------------------------------------
-
-        chat_history.append(
-            {
-                "role": "user",
-                "content": user_text,
-            }
-        )
-
-        chat_history.append(
-            {
-                "role": "assistant",
-                "content": reply,
-            }
-        )
-
-        return reply
+            return reply
 
 
 # Shared instance used by the main chatbot loop

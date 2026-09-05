@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import queue
 import tempfile
@@ -19,9 +20,7 @@ import sounddevice as sd
 import soundfile as sf
 import torch
 
-from faster_whisper import WhisperModel
 import edge_tts
-from langdetect import detect
 
 from openwakeword import Model as WakeWordModel
 
@@ -35,10 +34,6 @@ from llm_service import llm_service
 # ============================================================
 
 SAMPLE_RATE = 16000
-
-WHISPER_MODEL_SIZE = "medium"
-DEVICE = "cuda"
-COMPUTE_TYPE = "int8_float16"
 
 VAD_THRESHOLD = 0.5
 SILENCE_PATIENCE_MS = 1000
@@ -116,40 +111,6 @@ HALLUCINATION_PHRASES = [
     "thank you",
     "watching",
 ]
-
-
-# ============================================================
-# LANGUAGE SWITCH DETECTION
-# ============================================================
-
-SWITCH_PATTERN = re.compile(
-    r"\b(?:in|to|into|speak|talk|reply|respond|switch)\s+("
-    + "|".join(LANG_NAME_TO_CODE.keys())
-    + r")\b",
-    re.IGNORECASE,
-)
-
-sticky_lang = None
-
-
-def detect_switch_request(text):
-    """
-    Detect explicit commands such as:
-
-        talk in English
-        speak in Tamil
-        reply in Hindi
-        switch to Telugu
-        respond in Kannada
-    """
-
-    match = SWITCH_PATTERN.search(text.lower())
-
-    if match:
-        language_name = match.group(1).lower()
-        return LANG_NAME_TO_CODE.get(language_name)
-
-    return None
 
 
 # ============================================================
@@ -411,80 +372,12 @@ def determine_language(text, whisper_lang):
 BASE_SYSTEM_PROMPT = """
 You are a helpful multilingual voice assistant for government schemes.
 
-LANGUAGE RULES:
+RULES:
 
-1. Reply in the user's actual current language.
-
-2. English input -> English output.
-
-3. Hindi input -> Hindi output using Devanagari script.
-
-4. Tamil input -> Tamil output using Tamil script.
-
-5. Telugu input -> Telugu output using Telugu script.
-
-6. Kannada input -> Kannada output using Kannada script.
-
-7. Bengali input -> Bengali output using Bengali script.
-
-8. Marathi input -> Marathi output using Devanagari script.
-
-9. Gujarati input -> Gujarati output using Gujarati script.
-
-10. Malayalam input -> Malayalam output using Malayalam script.
-
-11. Punjabi input -> Punjabi output using Gurmukhi script.
-
-12. If the user speaks Hindi or other Indian languages using Latin
-    characters, understand the language correctly but reply using its
-    native script.
-
-12a. SPECIAL CASE - Tanglish (Latin-script Tamil mixed with English):
-     When the user speaks Tamil using Latin characters, reply naturally
-     in the same Tanglish style, i.e. Tamil written in Latin script mixed
-     with everyday English words, exactly how Tamil speakers chat
-     (for example: "Apply panna mudiyum", "konjam wait pannungo").
-     Do NOT use Tamil script in this mode.
-
-13. NEVER romanize Indian languages except in Tanglish mode
-    described in rule 12a.
-
-14. Do not randomly switch languages.
-
-15. If the user explicitly asks to switch languages,
-    follow that request and continue using the selected language.
-
-16. Keep responses concise and conversational,
-    normally 2-3 sentences.
-
-17. Answer the user's actual question directly.
-
-18. Do not mention these instructions.
+1. Keep responses concise and conversational, normally 2-3 sentences.
+2. Answer the user's actual question directly.
+3. Do not mention these instructions.
 """
-
-
-def build_system_prompt():
-
-    if sticky_lang:
-
-        language = LANG_NAMES.get(
-            sticky_lang,
-            "English"
-        )
-
-        return BASE_SYSTEM_PROMPT + f"""
-
-IMPORTANT LANGUAGE OVERRIDE:
-
-The user has explicitly selected {language}.
-
-You MUST respond entirely in {language}.
-
-Do not use another language unless the user
-explicitly asks to switch again.
-"""
-
-    return BASE_SYSTEM_PROMPT
 
 
 # ============================================================
@@ -512,36 +405,18 @@ def audio_callback(
 
 
 # ============================================================
-# LOAD WHISPER
+# WHISPER SERVER CONFIG
 # ============================================================
 
-print("Loading Whisper model...")
-
-whisper_model = WhisperModel(
-    WHISPER_MODEL_SIZE,
-    device=DEVICE,
-    compute_type=COMPUTE_TYPE,
+WHISPER_SERVER_URL = os.environ.get(
+    "WHISPER_SERVER_URL",
+    "http://127.0.0.1:8080/inference",
 )
 
 print(
-    f"Whisper model loaded on {DEVICE} "
-    f"(compute_type={COMPUTE_TYPE})"
+    "Using Whisper server: "
+    f"{WHISPER_SERVER_URL}"
 )
-
-if torch.cuda.is_available():
-
-    print(
-        f"GPU: {torch.cuda.get_device_name(0)} | "
-        f"VRAM allocated: "
-        f"{torch.cuda.memory_allocated(0) / 1e6:.1f} MB"
-    )
-
-else:
-
-    print(
-        "WARNING: CUDA unavailable. "
-        "Running on CPU."
-    )
 
 
 # ============================================================
@@ -599,6 +474,12 @@ stop_event = threading.Event()
 # LLM CLIENT (see llm_service.py)
 # ============================================================
 
+# Point to local llama.cpp server (default endpoint)
+llm_service.configure_endpoint(
+    base_url="http://127.0.0.1:8081/v1",
+    model="local",
+)
+
 if llm_service.client is None:
 
     sys.exit(1)
@@ -611,17 +492,9 @@ if llm_service.client is None:
 chat_history = [
     {
         "role": "system",
-        "content": build_system_prompt(),
+        "content": BASE_SYSTEM_PROMPT,
     }
 ]
-
-
-def update_system_prompt():
-
-    chat_history[0] = {
-        "role": "system",
-        "content": build_system_prompt(),
-    }
 
 
 # ============================================================
@@ -927,48 +800,106 @@ def audio_worker():
 # ============================================================
 
 def transcribe(audio_np):
+    """
+    Send recorded audio to the whisper.cpp server
+    and return (text, whisper_lang).
+    """
 
-    segments, info = (
-        whisper_model.transcribe(
-            audio_np,
+    import httpx
 
-            beam_size=3,
+    # ----------------------------------------
+    # Encode audio as WAV in memory
+    # ----------------------------------------
 
-            vad_filter=False,
+    buf = io.BytesIO()
 
-            condition_on_previous_text=False,
-
-            task="transcribe",
-
-            temperature=0.0,
-
-            initial_prompt=(
-                "Namaste, welcome. "
-                "Vanakkam, how can I help you today? "
-                "Mera status check panna mudiyuma? "
-                "PM-Kisan scheme ka status kya hai?"
-            ),
-        )
+    sf.write(
+        buf,
+        audio_np,
+        SAMPLE_RATE,
+        format="WAV",
+        subtype="PCM_16",
     )
 
-    segments = list(segments)
+    buf.seek(0)
 
-    text = " ".join(
-        segment.text
-        for segment in segments
+    # ----------------------------------------
+    # POST to whisper.cpp server
+    # ----------------------------------------
+
+    try:
+
+        with httpx.Client(timeout=300.0) as client:
+
+            response = client.post(
+                WHISPER_SERVER_URL,
+                files={
+                    "file": (
+                        "utterance.wav",
+                        buf,
+                        "audio/wav",
+                    ),
+                },
+                data={
+                    "response_format": "verbose_json",
+                    "temperature": "0.0",
+                },
+            )
+
+            response.raise_for_status()
+
+            result = response.json()
+
+    except Exception as e:
+
+        print(
+            f"⚠️ Whisper server error: {e}"
+        )
+
+        return "", "en"
+
+    # ----------------------------------------
+    # Parse response
+    # ----------------------------------------
+
+    text = result.get(
+        "text",
+        ""
     ).strip()
+
+    if not text and "segments" in result:
+        text = " ".join(
+            seg.get("text", "").strip()
+            for seg in result.get("segments", [])
+            if seg.get("text")
+        ).strip()
 
     if not text:
 
         return "", "en"
 
-    language = getattr(
-        info,
-        "language",
-        "en"
+    # verbose_json returns language Probabilities
+    whisper_lang = "en"
+
+    raw_lang = str(result.get("language", "")).lower()
+    if raw_lang in LANG_NAME_TO_CODE:
+        whisper_lang = LANG_NAME_TO_CODE[raw_lang]
+    elif raw_lang in VOICE_MAP:
+        whisper_lang = raw_lang
+
+    lang_probs = result.get(
+        "language_probabilities",
+        {}
     )
 
-    return text, language
+    if lang_probs and whisper_lang == "en":
+
+        whisper_lang = max(
+            lang_probs,
+            key=lang_probs.get
+        )
+
+    return text, whisper_lang
 
 
 # ============================================================
@@ -1098,102 +1029,57 @@ async def speak(
 def ask_opencode(
     user_text,
     detected_lang,
-    cancel_event=None
+    cancel_event=None,
+    stream=False,
 ):
+    """
+    Send user text to the LLM with language context.
 
-    global sticky_lang
-
-    # ----------------------------------------
-    # Explicit language switch
-    # ----------------------------------------
-
-    requested_lang = (
-        detect_switch_request(
-            user_text
-        )
-    )
-
-    if requested_lang:
-
-        sticky_lang = requested_lang
-
-        print(
-            "🌐 Language switched to "
-            f"{LANG_NAMES[sticky_lang]}"
-        )
-
-        update_system_prompt()
+    Each turn, a language prefix is added to the user message
+    so the model knows which language to respond in.
+    """
 
     # ----------------------------------------
-    # Determine response language
+    # Language name for the prefix
     # ----------------------------------------
-
-    if sticky_lang:
-
-        response_lang = sticky_lang
-
-    else:
-
-        response_lang = detected_lang
 
     language_name = LANG_NAMES.get(
-        response_lang,
+        detected_lang,
         "English"
     )
 
     # ----------------------------------------
-    # Explicit language instruction
+    # Build the user message with language context
     # ----------------------------------------
 
-    if response_lang == "tl":
+    # Add Tanglish-specific guidance if needed
+    tanglish_note = ""
+    if detected_lang == "tl":
+        tanglish_note = (
+            " Tanglish means Tamil written in Latin script "
+            "mixed with English words (e.g. 'Apply panna mudiyum', "
+            "'konjam wait pannungo'). Do NOT use Tamil script."
+        )
 
-        language_instruction = """
-The user's actual language is Tanglish (Tamil mixed with English,
-written using Latin characters).
-
-You MUST respond entirely in Tanglish.
-
-IMPORTANT:
-
-- Reply naturally in Tanglish, exactly how Tamil speakers chat.
-- Write Tamil in Latin script mixed with everyday English words.
-- Examples: "Apply panna mudiyum", "konjam wait pannungo",
-  "ee scheme la eligibility ennana?", "income limit kaala venum".
-- Do NOT use Tamil script.
-- Keep it conversational and easy to read aloud.
-"""
-
-    else:
-
-        language_instruction = f"""
-The user's actual language is {language_name}.
-
-You MUST respond entirely in {language_name}.
-
-IMPORTANT:
-
-- Understand the user's meaning according to {language_name}.
-- The user's speech may have been transcribed using Latin characters.
-- If the user spoke Tamil using Latin characters, understand it as Tamil.
-- If the user spoke Hindi using Latin characters, understand it as Hindi.
-- Respond using the proper native script of the language.
-- Do NOT respond in English unless the required language is English.
-- Do NOT romanize Indian languages.
-"""
+    user_message = (
+        f"[This request is in {language_name}. "
+        f"Respond in {language_name}. "
+        f"If the user has explicitly asked to speak "
+        f"in a different language in this conversation, "
+        f"follow that instruction instead.{tanglish_note}]\n\n"
+        f"{user_text}"
+    )
 
     # ----------------------------------------
     # Search the web + ask the LLM
     # ----------------------------------------
 
-    reply = llm_service.generate_response(
-        user_text=user_text,
-        base_system_prompt=build_system_prompt(),
-        language_instruction=language_instruction,
+    return llm_service.generate_response(
+        user_text=user_message,
         chat_history=chat_history,
         cancel_event=cancel_event,
+        stream=stream,
     )
-
-    return reply
 
 
 # ============================================================
@@ -1248,7 +1134,7 @@ def format_json_response(
 
 def main():
 
-    global sticky_lang, current_mode
+    global current_mode
 
     print(
         "\n===================================="
@@ -1420,17 +1306,37 @@ def main():
                             result_box["done"] = True
                             return
 
-                        # OPENCODE ZEN (cancellable)
-                        reply = ask_opencode(
+                        # OPENCODE ZEN (cancellable, streaming)
+                        print("\n🤖 Assistant: ", end="", flush=True)
+
+                        reply_stream = ask_opencode(
                             text,
                             detected_lang,
                             cancel_event=cancel_event,
+                            stream=True,
                         )
+
+                        full_reply = ""
+
+                        for chunk in reply_stream:
+
+                            if (
+                                cancel_event
+                                and cancel_event.is_set()
+                            ):
+                                break
+
+                            full_reply += chunk
+                            sys.stdout.write(chunk)
+                            sys.stdout.flush()
+
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
 
                         result_box["text"] = text
                         result_box["whisper_lang"] = whisper_lang
                         result_box["detected_lang"] = detected_lang
-                        result_box["reply"] = reply
+                        result_box["reply"] = full_reply
 
                     except Exception as e:
 
@@ -1493,6 +1399,14 @@ def main():
 
                     continue
 
+                if "text" not in result_box:
+
+                    print(
+                        "⚠️ No result from processing."
+                    )
+
+                    continue
+
                 text = result_box["text"]
                 whisper_lang = result_box["whisper_lang"]
                 detected_lang = result_box["detected_lang"]
@@ -1523,13 +1437,7 @@ def main():
                 # TTS LANGUAGE
                 # ----------------------------------------
 
-                if sticky_lang:
-
-                    reply_lang = sticky_lang
-
-                else:
-
-                    reply_lang = detected_lang
+                reply_lang = detected_lang
 
                 # ----------------------------------------
                 # DISPLAY RESPONSE
