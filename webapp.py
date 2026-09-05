@@ -37,6 +37,8 @@ from fastapi import (
     File,
     HTTPException,
     Depends,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.responses import (
     HTMLResponse,
@@ -407,6 +409,241 @@ async def text_to_speech(request: Request):
             status_code=500,
             detail=f"TTS error: {e}",
         )
+
+
+# ============================================================
+# WEBSOCKET: Real-time voice streaming
+# ============================================================
+
+
+@app.websocket("/ws/voice")
+async def websocket_voice(ws: WebSocket):
+    """
+    WebSocket for real-time voice streaming.
+
+    Protocol:
+      - Client opens connection
+      - Client sends binary messages: raw float32 PCM samples
+        (16kHz, mono, 4-byte float32 per sample)
+      - Client sends text message "done" when utterance ends
+      - Server transcribes, runs RAG+LLM, sends JSON response
+      - Server sends {"status": "ready"} when ready for next utterance
+    """
+
+    await ws.accept()
+    print("🔌 Voice WebSocket connected")
+
+    import httpx
+    import numpy as np
+
+    audio_chunks = []
+
+    try:
+        while True:
+            msg = await ws.receive()
+
+            if msg.get("type") == "websocket.receive":
+
+                # Binary message: raw PCM audio chunk
+                if msg.get("bytes"):
+                    audio_chunks.append(msg["bytes"])
+
+                # Text message: control commands
+                elif msg.get("text"):
+
+                    text = msg["text"].strip()
+
+                    if text == "done":
+                        # Process the complete utterance
+                        if not audio_chunks:
+                            await ws.send_json(
+                                {"error": "No audio captured"}
+                            )
+                            continue
+
+                        # Concatenate all chunks into one buffer
+                        full_audio = b"".join(audio_chunks)
+                        audio_chunks = []
+
+                        # Convert float32 PCM to WAV
+                        samples = np.frombuffer(
+                            full_audio, dtype=np.float32
+                        )
+
+                        duration = (
+                            len(samples) / 16000
+                        )
+                        print(
+                            f"🎤 Captured {duration:.1f}s "
+                            f"of audio"
+                        )
+
+                        if duration < 0.3:
+                            await ws.send_json(
+                                {
+                                    "error": (
+                                        "Audio too short. "
+                                        "Speak for at least "
+                                        "1 second."
+                                    )
+                                }
+                            )
+                            continue
+
+                        # Build WAV in memory
+                        import struct
+                        import io
+
+                        wav_buf = io.BytesIO()
+                        int16 = (
+                            np.clip(samples, -1.0, 1.0)
+                            * 32767
+                        ).astype(np.int16)
+
+                        # WAV header
+                        data_size = len(int16) * 2
+                        wav_buf.write(b"RIFF")
+                        wav_buf.write(
+                            struct.pack(
+                                "<I",
+                                36 + data_size,
+                            )
+                        )
+                        wav_buf.write(b"WAVE")
+                        wav_buf.write(b"fmt ")
+                        wav_buf.write(
+                            struct.pack("<I", 16)
+                        )
+                        wav_buf.write(
+                            struct.pack(
+                                "<HHIIHH",
+                                1, 1, 16000,
+                                32000, 2, 16,
+                            )
+                        )
+                        wav_buf.write(b"data")
+                        wav_buf.write(
+                            struct.pack("<I", data_size)
+                        )
+                        wav_buf.write(int16.tobytes())
+                        wav_buf.seek(0)
+
+                        # Send to whisper
+                        try:
+                            async with httpx.AsyncClient(
+                                timeout=300.0
+                            ) as client:
+                                resp = await client.post(
+                                    WHISPER_SERVER_URL,
+                                    files={
+                                        "file": (
+                                            "audio.wav",
+                                            wav_buf,
+                                            "audio/wav",
+                                        ),
+                                    },
+                                    data={
+                                        "response_format": (
+                                            "verbose_json"
+                                        ),
+                                        "temperature": (
+                                            "0.0"
+                                        ),
+                                    },
+                                )
+                                resp.raise_for_status()
+                                result = resp.json()
+                        except Exception as e:
+                            await ws.send_json(
+                                {
+                                    "error": (
+                                        f"Whisper error: {e}"
+                                    )
+                                }
+                            )
+                            continue
+
+                        transcription = result.get(
+                            "text", ""
+                        ).strip()
+
+                        if not transcription:
+                            await ws.send_json(
+                                {
+                                    "text": "",
+                                    "reply": "",
+                                    "error": (
+                                        "No speech detected"
+                                    ),
+                                }
+                            )
+                            continue
+
+                        print(
+                            f"📝 Transcribed: "
+                            f"{transcription}"
+                        )
+
+                        # RAG retrieval
+                        llm = get_llm()
+                        retriever = get_retriever()
+
+                        rag_context = None
+                        sources = []
+                        try:
+                            rag_context, sources = (
+                                retriever.get_context(
+                                    transcription
+                                )
+                            )
+                        except Exception as e:
+                            print(f"⚠️ RAG error: {e}")
+
+                        # LLM response
+                        chat_history = [
+                            {
+                                "role": "system",
+                                "content": "",
+                            }
+                        ]
+
+                        user_message = (
+                            "[This request is in English. "
+                            "Respond in the same language "
+                            "as the user.]\n\n"
+                            f"{transcription}"
+                        )
+
+                        reply = ""
+
+                        for chunk in llm.generate_response(
+                            user_text=user_message,
+                            chat_history=chat_history,
+                            stream=True,
+                            rag_context=rag_context,
+                        ):
+                            reply += chunk
+
+                        print(f"🤖 Reply: {reply[:100]}")
+
+                        # Send response
+                        await ws.send_json(
+                            {
+                                "text": transcription,
+                                "reply": reply,
+                                "sources": sources,
+                            }
+                        )
+
+                    elif text == "ping":
+                        await ws.send_json(
+                            {"status": "ready"}
+                        )
+
+    except WebSocketDisconnect:
+        print("🔌 Voice WebSocket disconnected")
+    except Exception as e:
+        print(f"⚠️ WebSocket error: {e}")
 
 
 # ============================================================
