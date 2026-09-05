@@ -465,8 +465,19 @@
         async function sendVoice(audioBlob) {
             if (welcome) welcome.style.display = 'none';
 
+            // Convert webm/opus to WAV using Web Audio API
+            let wavBlob;
+            try {
+                wavBlob = await convertToWav(audioBlob);
+            } catch (e) {
+                console.error('Audio conversion failed:', e);
+                addMessage('Could not process audio. Please try typing instead.', 'assistant');
+                statusText.textContent = 'Ready';
+                return;
+            }
+
             const formData = new FormData();
-            formData.append('file', audioBlob, 'audio.webm');
+            formData.append('file', wavBlob, 'audio.wav');
 
             try {
                 const response = await fetch('/api/voice', {
@@ -514,6 +525,61 @@
                 }
             } catch (e) {
                 console.log('TTS failed, skipping audio');
+            }
+        }
+
+        // ========== AUDIO CONVERSION ==========
+        async function convertToWav(blob) {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+            // Resample to 16kHz mono
+            const targetSampleRate = 16000;
+            const numChannels = 1;
+            const length = Math.floor(audioBuffer.duration * targetSampleRate);
+            const wavBuffer = new ArrayBuffer(44 + length * 2);
+            const view = new DataView(wavBuffer);
+
+            // WAV header
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + length * 2, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true); // PCM
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, targetSampleRate, true);
+            view.setUint32(28, targetSampleRate * numChannels * 2, true);
+            view.setUint16(32, numChannels * 2, true);
+            view.setUint16(34, 16, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, length * 2, true);
+
+            // Downsample and write mono samples
+            const left = audioBuffer.getChannelData(0);
+            const offlineCtx = new OfflineAudioContext(1, length, targetSampleRate);
+            const source = offlineCtx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(offlineCtx.destination);
+            source.start(0);
+            const rendered = await offlineCtx.startRendering();
+            const renderedData = rendered.getChannelData(0);
+
+            let offset = 44;
+            for (let i = 0; i < length; i++) {
+                const sample = Math.max(-1, Math.min(1, renderedData[i]));
+                view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+                offset += 2;
+            }
+
+            audioCtx.close();
+            return new Blob([wavBuffer], { type: 'audio/wav' });
+        }
+
+        function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
             }
         }
 

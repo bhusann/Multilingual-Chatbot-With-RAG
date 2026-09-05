@@ -127,12 +127,19 @@ _admin_tokens = set()
 
 def verify_admin(request: Request):
     """Check if the request has a valid admin token."""
+    # Check Authorization header first (from JS fetch)
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and auth[7:] in _admin_tokens:
+        return True
+
+    # Fallback to cookie
     token = request.cookies.get("admin_token")
-    if not token or token not in _admin_tokens:
-        raise HTTPException(
-            status_code=401, detail="Unauthorized"
-        )
-    return True
+    if token and token in _admin_tokens:
+        return True
+
+    raise HTTPException(
+        status_code=401, detail="Unauthorized"
+    )
 
 
 # ============================================================
