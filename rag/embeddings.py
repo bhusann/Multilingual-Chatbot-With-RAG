@@ -170,11 +170,21 @@ def embed_texts(texts):
     """
     Convenience function: embed texts using the
     singleton model.
+
+    Returns numpy array of shape (n, dim).
+    If a single string is passed, returns shape (dim,).
     """
 
     model = get_embedding_model()
 
-    return model.embed(texts)
+    single = isinstance(texts, str)
+
+    result = model.embed(texts if not single else [texts])
+
+    if single:
+        return result[0]  # (dim,)
+
+    return result  # (n, dim)
 
 
 def get_embedding_dim():
