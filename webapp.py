@@ -24,6 +24,8 @@ import json
 import asyncio
 import tempfile
 import uuid
+import threading
+import time
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -479,7 +481,8 @@ async def websocket_voice(ws: WebSocket):
         await send_json(msg)
 
     async def send_tts_audio(text, lang="en"):
-        """Generate TTS and send audio chunks."""
+        """Generate TTS and send audio chunks.
+        Splits long text into sentences for reliability."""
         voice_map = {
             "en": "en-IN-NeerjaExpressiveNeural",
             "hi": "hi-IN-SwaraNeural",
@@ -487,26 +490,54 @@ async def websocket_voice(ws: WebSocket):
         }
         voice = voice_map.get(lang, voice_map["en"])
 
+        tmp_path = None
+
         try:
-            communicate = edge_tts.Communicate(text, voice)
+            # Split into sentences for reliability
+            import re
+            sentences = re.split(r'(?<=[.!?।])\s+', text.strip())
+            # Merge very short fragments
+            merged = []
+            buf = ""
+            for s in sentences:
+                buf = f"{buf} {s}".strip() if buf else s
+                if len(buf) > 100:
+                    merged.append(buf)
+                    buf = ""
+            if buf:
+                merged.append(buf)
 
-            with tempfile.NamedTemporaryFile(
-                suffix=".mp3", delete=False
-            ) as tmp:
-                tmp_path = tmp.name
+            all_audio = []
 
-            await communicate.save(tmp_path)
+            for part in merged:
+                communicate = edge_tts.Communicate(part, voice)
+                audio_bytes = b""
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        audio_bytes += chunk["data"]
 
-            data, sr = sf.read(
-                tmp_path, dtype="float32"
-            )
-            os.remove(tmp_path)
+                if audio_bytes:
+                    import io as _io
+                    data, sr = sf.read(
+                        _io.BytesIO(audio_bytes),
+                        dtype="float32",
+                    )
+                    all_audio.append(data)
+
+            if not all_audio:
+                print("⚠️ TTS: no audio generated")
+                return
+
+            import numpy as _np
+            full_audio = _np.concatenate(all_audio)
 
             # Convert to int16 PCM and send as chunks
             int16 = (
-                np.clip(data * VOLUME_SCALE, -1.0, 1.0)
+                _np.clip(full_audio * VOLUME_SCALE, -1.0, 1.0)
                 * 32767
-            ).astype(np.int16)
+            ).astype(_np.int16)
+
+            sr = 24000  # edge-tts default sample rate
 
             # Send header: audio info
             await send_json({
@@ -527,6 +558,8 @@ async def websocket_voice(ws: WebSocket):
 
         except Exception as e:
             print(f"⚠️ TTS error: {e}")
+            import traceback
+            traceback.print_exc()
 
     # ---- background thread: audio pipeline ----
 
