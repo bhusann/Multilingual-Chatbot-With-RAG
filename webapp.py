@@ -21,6 +21,7 @@ Usage:
 import io
 import os
 import json
+import re
 import asyncio
 import tempfile
 import uuid
@@ -509,7 +510,8 @@ async def websocket_voice(ws: WebSocket):
 
             all_audio = []
 
-            for part in merged:
+            for i, part in enumerate(merged):
+                print(f"  TTS part {i}: {repr(part[:80])}...")
                 communicate = edge_tts.Communicate(part, voice)
                 audio_bytes = b""
                 async for chunk in communicate.stream():
@@ -799,8 +801,23 @@ async def websocket_voice(ws: WebSocket):
 
         # ---- TTS → play in browser ----
 
+        # Clean markdown for TTS (same as legacy app)
+        def clean_for_tts(t):
+            if not t:
+                return t
+            t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
+            t = re.sub(r"\*(.+?)\*", r"\1", t)
+            t = re.sub(r"`([^`]+)`", r"\1", t)
+            t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+            t = re.sub(r"https?://\S+", "", t)
+            t = re.sub(r"^#{1,6}\s+", "", t, flags=re.MULTILINE)
+            t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.MULTILINE)
+            t = re.sub(r"\s{2,}", " ", t)
+            t = t.replace("**", "").replace("__", "")
+            return t.strip()
+
         await send_status("speaking")
-        await send_tts_audio(reply)
+        await send_tts_audio(clean_for_tts(reply))
 
         # Done speaking, ready for next utterance
         await send_status("listening")
@@ -986,6 +1003,12 @@ async def startup():
     print(
         "========================================\n"
     )
+
+    # Preload embedding model at startup
+    from rag.embeddings import get_embedding_model
+    print("Preloading embedding model...")
+    get_embedding_model()
+    print("Embedding model ready.\n")
 
 
 # ============================================================
