@@ -342,6 +342,10 @@
                             updateStatus('speaking');
                             break;
                         case 'idle':
+                            // Server timed out, reset browser UI
+                            isConversationActive = false;
+                            micBtn.classList.remove('recording');
+                            micBtn.innerHTML = '🎤';
                             updateStatus('ready');
                             break;
                         case 'tts_audio':

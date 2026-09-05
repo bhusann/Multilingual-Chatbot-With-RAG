@@ -455,6 +455,7 @@ async def websocket_voice(ws: WebSocket):
     SAMPLE_RATE = 16000
     VAD_THRESHOLD = 0.5
     SILENCE_PATIENCE_MS = 1200
+    IDLE_TIMEOUT_S = 15.0  # auto-stop after this many seconds of silence
     VOLUME_SCALE = 0.1
 
     audio_q = queue.Queue()
@@ -563,10 +564,22 @@ async def websocket_voice(ws: WebSocket):
                     recorded = []
                     triggered = False
                     silence_counter = 0
-
-                    loop_start = time.time()
+                    listen_start = time.time()
 
                     while not stop_evt.is_set():
+
+                        # Check idle timeout
+                        elapsed = time.time() - listen_start
+                        if elapsed > IDLE_TIMEOUT_S:
+                            print(
+                                f"⏳ Idle timeout "
+                                f"({IDLE_TIMEOUT_S}s). "
+                                f"Stopping."
+                            )
+                            asyncio.run(
+                                send_status("idle")
+                            )
+                            return
 
                         try:
                             chunk = audio_q.get(
@@ -613,14 +626,13 @@ async def websocket_voice(ws: WebSocket):
                                 )
 
                                 # Run the full pipeline
-                                loop_start = time.time()
                                 asyncio.run(
                                     process_utterance(
                                         utterance,
                                         chat_history,
                                     )
                                 )
-                                loop_start = time.time()
+                                listen_start = time.time()
 
                                 break
 
