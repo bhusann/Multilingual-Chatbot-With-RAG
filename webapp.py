@@ -12,6 +12,9 @@ Routes:
     POST /admin/api/upload     - Upload document
     DELETE /admin/api/documents/{doc_id} - Delete document
 
+    GET  /audio-processor.js   - AudioWorklet script for browser mic capture
+    WS   /ws/voice             - Voice pipeline (browser mic -> VAD -> whisper -> LLM -> TTS)
+
 Usage:
     python webapp.py
     # or
@@ -25,9 +28,11 @@ import re
 import asyncio
 import tempfile
 import uuid
-import threading
 import time
+import struct
+import threading
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 
@@ -43,13 +48,13 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from starlette.websockets import WebSocketState
 from fastapi.responses import (
     HTMLResponse,
     StreamingResponse,
     JSONResponse,
     Response,
 )
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 # ============================================================
@@ -65,6 +70,34 @@ WHISPER_SERVER_URL = os.environ.get(
     "http://127.0.0.1:8080/inference",
 )
 
+# Voice pipeline config
+SAMPLE_RATE = 16000
+VAD_CHUNK_SIZE = 512
+VAD_THRESHOLD = 0.5
+SILENCE_PATIENCE_MS = 1200
+IDLE_TIMEOUT_S = 30.0
+
+# ============================================================
+# LIFESPAN (Modern FastAPI startup/shutdown)
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("\n========================================")
+    print("  Government Scheme RAG Assistant")
+    print("========================================")
+    print("  Chat UI:   http://localhost:5000/")
+    print("  Admin:     http://localhost:5000/admin")
+    print(f"  Password:  {ADMIN_PASSWORD}")
+    print("========================================\n")
+
+    # Preload embedding model
+    from rag.embeddings import get_embedding_model
+    print("Preloading embedding model...")
+    get_embedding_model()
+    print("Embedding model ready.\n")
+    yield
+
 # ============================================================
 # APP
 # ============================================================
@@ -73,6 +106,7 @@ app = FastAPI(
     title="Government Scheme Assistant",
     docs_url=None,
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 # Templates
@@ -89,6 +123,7 @@ templates = Jinja2Templates(
 _llm = None
 _retriever = None
 _store = None
+_vad_model = None
 
 
 def get_llm():
@@ -122,22 +157,69 @@ def get_store():
     return _store
 
 
+def get_vad_model():
+    """Lazy-load Silero VAD model (only when voice is first used)."""
+    global _vad_model
+    if _vad_model is None:
+        import torch
+        _vad_model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+        )
+        print("Silero VAD loaded for web voice pipeline.")
+    return _vad_model
+
+
+# ============================================================
+# SERVER-SIDE CHAT SESSIONS
+# ============================================================
+
+_chat_sessions = {}
+SESSION_TTL = 3600
+
+
+def _get_or_create_session(session_id=None):
+    """Get an existing session or create a new one."""
+    now = time.time()
+
+    # Cleanup stale sessions
+    stale = [
+        sid for sid, s in _chat_sessions.items()
+        if now - s["last_access"] > SESSION_TTL
+    ]
+    for sid in stale:
+        del _chat_sessions[sid]
+
+    if session_id and session_id in _chat_sessions:
+        session = _chat_sessions[session_id]
+        session["last_access"] = now
+        return session_id, session
+
+    # Create new session
+    llm = get_llm()
+    new_id = uuid.uuid4().hex[:16]
+    _chat_sessions[new_id] = {
+        "history": [
+            {"role": "system", "content": llm.system_prompt}
+        ],
+        "last_access": now,
+    }
+    return new_id, _chat_sessions[new_id]
+
+
 # ============================================================
 # AUTH: Simple session-based admin password
 # ============================================================
 
-# In-memory session tokens (good enough for single-user admin)
 _admin_tokens = set()
 
 
 def verify_admin(request: Request):
     """Check if the request has a valid admin token."""
-    # Check Authorization header first (from JS fetch)
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer ") and auth[7:] in _admin_tokens:
         return True
 
-    # Fallback to cookie
     token = request.cookies.get("admin_token")
     if token and token in _admin_tokens:
         return True
@@ -161,22 +243,69 @@ async def chat_ui(request: Request):
 
 
 # ============================================================
-# CHAT API (text input, streaming SSE)
+# AUDIO WORKLET (served as JS for browser mic capture)
+# ============================================================
+
+AUDIO_WORKLET_JS = """
+class PCMProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this._buffer = new Float32Array(0);
+        this._chunkSize = 512;
+    }
+
+    process(inputs, outputs, parameters) {
+        const input = inputs[0] && inputs[0][0];
+        if (!input || input.length === 0) return true;
+
+        // Accumulate samples
+        const newBuf = new Float32Array(this._buffer.length + input.length);
+        newBuf.set(this._buffer);
+        newBuf.set(input, this._buffer.length);
+        this._buffer = newBuf;
+
+        // Send 512-sample chunks (32ms at 16kHz) as int16
+        while (this._buffer.length >= this._chunkSize) {
+            const chunk = this._buffer.subarray(0, this._chunkSize);
+            const int16 = new Int16Array(this._chunkSize);
+            for (let i = 0; i < this._chunkSize; i++) {
+                const s = Math.max(-1, Math.min(1, chunk[i]));
+                int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            this.port.postMessage(int16.buffer, [int16.buffer]);
+            this._buffer = this._buffer.subarray(this._chunkSize);
+        }
+        return true;
+    }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+"""
+
+
+@app.get("/audio-processor.js")
+async def audio_processor_js():
+    """Serve the AudioWorklet processor script."""
+    return Response(
+        content=AUDIO_WORKLET_JS,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ============================================================
+# CHAT API (text input, streaming SSE with server-side sessions)
 # ============================================================
 
 
 @app.post("/api/chat")
 async def chat(request: Request):
     """
-    Accept a text message, return streaming SSE with
-    the LLM response.
-
-    Request body: {"message": "user text", "history": [...]}
+    Accept a text message, return streaming SSE with the LLM response.
+    Uses server-side session for chat history to preserve KV cache across turns.
     """
-
     body = await request.json()
     user_text = body.get("message", "").strip()
-    history = body.get("history", [])
+    session_id = body.get("session_id", "")
 
     if not user_text:
         raise HTTPException(
@@ -184,30 +313,42 @@ async def chat(request: Request):
         )
 
     llm = get_llm()
+    session_id, session = _get_or_create_session(session_id)
+    chat_history = session["history"]
 
-    # Build chat history for the LLM
-    chat_history = [{"role": "system", "content": ""}]
-    chat_history.extend(history)
+    user_msg = format_user_message(user_text)
 
-    # Language context prefix
-    user_message = (
-        f"[This request is in English. "
-        f"Respond in the same language as the user.]\n\n"
-        f"{user_text}"
-    )
+    # Use background thread queue to ensure generator doesn't block event loop
+    loop = asyncio.get_running_loop()
+    q = asyncio.Queue()
+
+    def run_llm():
+        try:
+            for chunk in llm.generate_response(
+                user_text=user_msg,
+                chat_history=chat_history,
+                stream=True,
+            ):
+                loop.call_soon_threadsafe(q.put_nowait, ("chunk", chunk))
+            loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+        except Exception as e:
+            loop.call_soon_threadsafe(q.put_nowait, ("error", str(e)))
+
+    threading.Thread(target=run_llm, daemon=True).start()
 
     async def event_stream():
-        full_reply = ""
-
-        for chunk in llm.generate_response(
-            user_text=user_message,
-            chat_history=chat_history,
-            stream=True,
-        ):
-            full_reply += chunk
-            yield f"data: {json.dumps({'text': chunk})}\n\n"
-
-        yield "data: [DONE]\n\n"
+        while True:
+            msg_type, payload = await q.get()
+            if msg_type == "chunk":
+                yield f"data: {json.dumps({'text': payload})}\n\n"
+            elif msg_type == "done":
+                yield f"data: {json.dumps({'session_id': session_id})}\n\n"
+                yield "data: [DONE]\n\n"
+                break
+            elif msg_type == "error":
+                yield f"data: {json.dumps({'error': payload})}\n\n"
+                yield "data: [DONE]\n\n"
+                break
 
     return StreamingResponse(
         event_stream(),
@@ -220,7 +361,7 @@ async def chat(request: Request):
 
 
 # ============================================================
-# VOICE API (audio input -> text -> response)
+# VOICE API (audio file upload -> text -> response)
 # ============================================================
 
 
@@ -230,40 +371,23 @@ async def voice_input(
 ):
     """
     Accept audio file, transcribe with whisper,
-    then run RAG + LLM. Returns JSON with text
-    and optionally audio URL.
+    then run RAG + LLM. Returns JSON with text and reply.
     """
-
     import httpx
 
-    # Read audio
     audio_bytes = await file.read()
-
     if len(audio_bytes) < 1000:
         raise HTTPException(
             status_code=400,
             detail="Audio too short",
         )
 
-    # Send to whisper.cpp server
     try:
-        async with httpx.AsyncClient(
-            timeout=300.0
-        ) as client:
-
+        async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
                 WHISPER_SERVER_URL,
-                files={
-                    "file": (
-                        "audio.wav",
-                        audio_bytes,
-                        "audio/wav",
-                    ),
-                },
-                data={
-                    "response_format": "verbose_json",
-                    "temperature": "0.0",
-                },
+                files={"file": ("audio.wav", audio_bytes, "audio/wav")},
+                data={"response_format": "verbose_json", "temperature": "0.0"},
             )
             response.raise_for_status()
             result = response.json()
@@ -273,44 +397,25 @@ async def voice_input(
             detail=f"Whisper server error: {e}",
         )
 
-    # Parse transcription
     text = result.get("text", "").strip()
-
     if not text:
         return JSONResponse(
-            {
-                "text": "",
-                "reply": "",
-                "error": "No speech detected",
-            }
+            {"text": "", "reply": "", "error": "No speech detected"}
         )
 
-    # LLM (tools: web_search + rag_search)
     llm = get_llm()
+    _, session = _get_or_create_session()
+    chat_history = session["history"]
 
-    chat_history = [{"role": "system", "content": ""}]
-
-    user_message = (
-        f"[This request is in English. "
-        f"Respond in the same language as the user.]\n\n"
-        f"{text}"
-    )
-
-    reply = ""
-
-    for chunk in llm.generate_response(
-        user_text=user_message,
+    # Run LLM in thread to avoid blocking asyncio event loop
+    reply = await asyncio.to_thread(
+        llm.generate_response,
+        user_text=text,
         chat_history=chat_history,
-        stream=True,
-    ):
-        reply += chunk
-
-    return JSONResponse(
-        {
-            "text": text,
-            "reply": reply,
-        }
+        stream=False,
     )
+
+    return JSONResponse({"text": text, "reply": reply})
 
 
 # ============================================================
@@ -321,51 +426,34 @@ async def voice_input(
 @app.post("/api/tts")
 async def text_to_speech(request: Request):
     """Convert text to speech using edge-tts."""
-
     import edge_tts
 
     body = await request.json()
     text = body.get("text", "").strip()
-    lang = body.get("lang", "en")
+    lang = body.get("lang")
 
     if not text:
         raise HTTPException(
             status_code=400, detail="Empty text"
         )
 
-    voice_map = {
-        "en": "en-IN-NeerjaExpressiveNeural",
-        "hi": "hi-IN-SwaraNeural",
-        "ta": "ta-IN-PallaviNeural",
-    }
-
-    voice = voice_map.get(lang, voice_map["en"])
+    voice = select_voice(text, preferred_lang=lang)
 
     try:
         communicate = edge_tts.Communicate(text, voice)
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".mp3", delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             tmp_path = tmp.name
 
         await communicate.save(tmp_path)
-
         with open(tmp_path, "rb") as f:
             audio_data = f.read()
-
         os.remove(tmp_path)
 
         return Response(
             content=audio_data,
             media_type="audio/mpeg",
-            headers={
-                "Content-Disposition": (
-                    "attachment; filename=speech.mp3"
-                ),
-            },
+            headers={"Content-Disposition": "attachment; filename=speech.mp3"},
         )
-
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -374,32 +462,177 @@ async def text_to_speech(request: Request):
 
 
 # ============================================================
-# WEBSOCKET: Voice pipeline (backend owns the mic)
+# WEBSOCKET: Voice pipeline (browser mic -> VAD -> whisper -> LLM -> TTS)
 # ============================================================
+
+
+# ============================================================
+# VOICE & MULTILINGUAL TTS
+# ============================================================
+
+VOICE_MAP = {
+    "en": "en-IN-NeerjaExpressiveNeural",
+    "tl": "en-IN-NeerjaExpressiveNeural",
+    "hi": "hi-IN-SwaraNeural",
+    "ta": "ta-IN-PallaviNeural",
+    "te": "te-IN-ShrutiNeural",
+    "kn": "kn-IN-SapnaNeural",
+    "bn": "bn-IN-TanishaaNeural",
+    "mr": "mr-IN-AarohiNeural",
+    "gu": "gu-IN-DhwaniNeural",
+    "ml": "ml-IN-SobhanaNeural",
+    "pa": "pa-IN-VaaniNeural",
+}
+
+
+def detect_script_language(text):
+    """Detect Indian language based on Unicode script."""
+    for char in text:
+        code = ord(char)
+        if 0x0900 <= code <= 0x097F:
+            return "hi"  # Devanagari (Hindi / Marathi)
+        if 0x0980 <= code <= 0x09FF:
+            return "bn"  # Bengali
+        if 0x0A00 <= code <= 0x0A7F:
+            return "pa"  # Gurmukhi (Punjabi)
+        if 0x0A80 <= code <= 0x0AFF:
+            return "gu"  # Gujarati
+        if 0x0B80 <= code <= 0x0BFF:
+            return "ta"  # Tamil
+        if 0x0C00 <= code <= 0x0C7F:
+            return "te"  # Telugu
+        if 0x0C80 <= code <= 0x0CFF:
+            return "kn"  # Kannada
+        if 0x0D00 <= code <= 0x0D7F:
+            return "ml"  # Malayalam
+    return None
+
+
+TAMIL_ROMAN_WORDS = {
+    "panna", "mudiyuma", "mudiyum", "enna", "epdi", "eppadi", "iruka", "irukinga",
+    "irukiya", "panra", "panren", "pannunga", "venum", "vendam", "illai", "illa",
+    "aama", "sollunga", "sollu", "inga", "anga", "romba", "nalla", "saptiya",
+    "saaptiya", "sapten", "saapten", "theriyuma", "theriyala", "kudunga", "kudu",
+    "vaanga", "pora", "poren", "poga", "vandhu", "vantha", "vandha", "irukku",
+    "iruku", "yen", "yenga", "engae", "konjam", "seekiram", "ippo", "ippa",
+    "naalaikku", "innaikku", "nethu", "enakku", "unakku", "ungalukku", "namma",
+    "nanga", "naan", "nee", "neenga",
+}
+
+HINDI_ROMAN_WORDS = {
+    "kya", "kaise", "kaisa", "kaisi", "hain", "aap", "mujhe", "mujhko", "mera",
+    "meri", "mere", "hum", "ham", "karna", "karo", "raha", "rahi", "rahe",
+    "chahiye", "nahi", "nahin", "acha", "achha", "accha", "theek", "thik",
+    "kyun", "kyon", "kaun", "kab", "kahan", "kidhar", "yeh", "yah", "woh",
+    "voh", "mujhse", "aapka", "aapki", "aapke", "pata", "batao", "bataiye",
+    "chalo", "dekho", "sakta", "sakti", "sakte",
+}
+
+
+def detect_roman_indian_language(text):
+    """Detect Tanglish / Hinglish from Romanized text."""
+    text = text.lower().strip()
+    words = set(re.findall(r"[a-z]+", text))
+    tamil_score = len(words & TAMIL_ROMAN_WORDS)
+    hindi_score = len(words & HINDI_ROMAN_WORDS)
+
+    if tamil_score >= 2 and tamil_score > hindi_score:
+        return "tl"
+    if hindi_score >= 2 and hindi_score > tamil_score:
+        return "hi"
+    return None
+
+
+LANG_NAMES = {
+    "en": "English",
+    "tl": "Tanglish",
+    "hi": "Hindi",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "kn": "Kannada",
+    "bn": "Bengali",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "ml": "Malayalam",
+    "pa": "Punjabi",
+}
+
+
+def format_user_message(user_text, whisper_lang="en"):
+    """
+    Format the user message with per-turn language instruction tag.
+    Keeps system prompt static (at index 0) for KV cache preservation.
+    """
+    lang = detect_script_language(user_text)
+    if not lang:
+        lang = detect_roman_indian_language(user_text)
+    if not lang and whisper_lang in VOICE_MAP:
+        lang = whisper_lang
+    if not lang:
+        lang = "en"
+
+    lang_name = LANG_NAMES.get(lang, "English")
+    tanglish_note = ""
+    if lang == "tl":
+        tanglish_note = (
+            " Tanglish means Tamil written in Latin script "
+            "mixed with English words (e.g. 'Apply panna mudiyum', "
+            "'konjam wait pannungo'). Do NOT use Tamil script."
+        )
+
+    return (
+        f"[This request is in {lang_name}. "
+        f"Respond in {lang_name}. "
+        f"If the user has explicitly asked to speak "
+        f"in a different language in this conversation, "
+        f"follow that instruction instead.{tanglish_note}]\n\n"
+        f"{user_text}"
+    )
+
+
+def select_voice(text, preferred_lang=None):
+    """Select the best Edge-TTS neural voice for the given text."""
+    if preferred_lang and preferred_lang in VOICE_MAP:
+        return VOICE_MAP[preferred_lang]
+
+    # Detect by native Unicode script
+    lang = detect_script_language(text)
+    if not lang:
+        # Check romanized Indian language (Tanglish / Hinglish)
+        lang = detect_roman_indian_language(text)
+
+    return VOICE_MAP.get(lang, VOICE_MAP["en"])
+
+
+def _clean_for_tts(t):
+    """Clean markdown formatting for TTS."""
+    if not t:
+        return t
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
+    t = re.sub(r"\*(.+?)\*", r"\1", t)
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    t = re.sub(r"https?://\S+", "", t)
+    t = re.sub(r"^#{1,6}\s+", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.MULTILINE)
+    t = re.sub(r"\s{2,}", " ", t)
+    t = t.replace("**", "").replace("__", "")
+    return t.strip()
 
 
 @app.websocket("/ws/voice")
 async def websocket_voice(ws: WebSocket):
     """
-    Voice WebSocket — backend owns the microphone.
+    Voice WebSocket — browser captures mic and streams audio.
 
-    Protocol:
-      - Browser sends {"action": "start"} → server starts
-        capturing mic, processing speech, speaking replies
-      - Browser sends {"action": "stop"} → server stops
-      - Server sends {"status": "..."} for UI state updates
-      - Server sends {"text": "...", "reply": "..."} for
-        each conversation turn
-      - Server sends binary chunks for TTS audio playback
+    States:
+      - 'idle': Voice not running
+      - 'listening': Receiving mic frames, running VAD
+      - 'processing': Transcribing with whisper, running LLM
+      - 'speaking': Streaming TTS audio to browser
+      - 'waiting_playback': Browser is playing TTS, mic muted
     """
-
-    import io
-    import struct
-    import queue
-
     import numpy as np
-    import sounddevice as sd
-    import soundfile as sf
     import torch
     import httpx
     import edge_tts
@@ -407,407 +640,319 @@ async def websocket_voice(ws: WebSocket):
     await ws.accept()
     print("🔌 Voice WebSocket connected")
 
-    # Load Silero VAD
-    vad_model, _ = torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
+    vad_model = get_vad_model()
+
+    # Per-connection state
+    state = "idle"  # idle | listening | processing | speaking | waiting_playback
+    vad_buffer = np.zeros(0, dtype=np.float32)
+    recorded_chunks = []
+    speech_triggered = False
+    silence_counter = 0
+    last_speech_time = time.time()
+
+    chunks_per_second = SAMPLE_RATE / VAD_CHUNK_SIZE
+    max_silence_chunks = int(
+        (SILENCE_PATIENCE_MS / 1000) * chunks_per_second
     )
 
-    # Config
-    SAMPLE_RATE = 16000
-    VAD_THRESHOLD = 0.5
-    SILENCE_PATIENCE_MS = 1200
-    IDLE_TIMEOUT_S = 15.0  # auto-stop after this many seconds of silence
-    VOLUME_SCALE = 0.1
+    # Server-side chat session shared between voice and text chat
+    session_id = ws.query_params.get("session_id")
+    session_id, session = _get_or_create_session(session_id)
+    chat_history = session["history"]
+    llm = get_llm()
 
-    audio_q = queue.Queue()
-    stop_evt = threading.Event()
+    async def safe_send_json(payload):
+        if ws.client_state == WebSocketState.CONNECTED:
+            try:
+                await ws.send_json(payload)
+                return True
+            except Exception:
+                return False
+        return False
 
-    def audio_callback(indata, frames, time_info, status):
-        audio_q.put(indata.copy())
+    async def safe_send_bytes(payload):
+        if ws.client_state == WebSocketState.CONNECTED:
+            try:
+                await ws.send_bytes(payload)
+                return True
+            except Exception:
+                return False
+        return False
 
-    # ---- send helpers (thread-safe) ----
-
-    async def send_json(data):
-        await ws.send_json(data)
-
-    async def send_status(status):
-        await send_json({"status": status})
-
-    async def send_result(text, reply, sources=None):
-        msg = {"text": text, "reply": reply}
-        if sources:
-            msg["sources"] = sources
-        await send_json(msg)
-
-    async def send_tts_audio(text, lang="en"):
-        """Generate TTS and send audio chunks.
-        Splits long text into sentences for reliability."""
-        voice_map = {
-            "en": "en-IN-NeerjaExpressiveNeural",
-            "hi": "hi-IN-SwaraNeural",
-            "ta": "ta-IN-PallaviNeural",
-        }
-        voice = voice_map.get(lang, voice_map["en"])
-
-        tmp_path = None
-
-        try:
-            # Split into sentences for reliability
-            import re
-            sentences = re.split(r'(?<=[.!?।])\s+', text.strip())
-            # Merge very short fragments
-            merged = []
-            buf = ""
-            for s in sentences:
-                buf = f"{buf} {s}".strip() if buf else s
-                if len(buf) > 100:
-                    merged.append(buf)
-                    buf = ""
-            if buf:
-                merged.append(buf)
-
-            all_audio = []
-
-            for i, part in enumerate(merged):
-                print(f"  TTS part {i}: {repr(part[:80])}...")
-                communicate = edge_tts.Communicate(part, voice)
-                audio_bytes = b""
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        audio_bytes += chunk["data"]
-
-                if audio_bytes:
-                    import io as _io
-                    data, sr = sf.read(
-                        _io.BytesIO(audio_bytes),
-                        dtype="float32",
-                    )
-                    all_audio.append(data)
-
-            if not all_audio:
-                print("⚠️ TTS: no audio generated")
-                return
-
-            import numpy as _np
-            full_audio = _np.concatenate(all_audio)
-
-            # Convert to int16 PCM and send as chunks
-            int16 = (
-                _np.clip(full_audio * VOLUME_SCALE, -1.0, 1.0)
-                * 32767
-            ).astype(_np.int16)
-
-            sr = 24000  # edge-tts default sample rate
-
-            # Send header: audio info
-            await send_json({
-                "status": "tts_audio",
-                "sample_rate": sr,
-                "channels": 1,
-                "total_samples": len(int16),
-            })
-
-            # Send audio in chunks
-            chunk_size = sr  # 1 second per chunk
-            for i in range(0, len(int16), chunk_size):
-                chunk = int16[i : i + chunk_size]
-                await ws.send_bytes(chunk.tobytes())
-
-            # Signal end of audio
-            await send_json({"status": "tts_done"})
-
-        except Exception as e:
-            print(f"⚠️ TTS error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # ---- background thread: audio pipeline ----
-
-    def voice_pipeline_thread():
-        """
-        Runs the voice loop in a background thread.
-        Same logic as chatbot.py but without wake word.
-        """
-
-        chunk_size = 512
-        chunks_per_second = SAMPLE_RATE / chunk_size
-        max_silence_chunks = int(
-            (SILENCE_PATIENCE_MS / 1000)
-            * chunks_per_second
-        )
-
-        chat_history = [
-            {"role": "system", "content": ""}
-        ]
-
-        try:
-
-            with sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                blocksize=chunk_size,
-                callback=audio_callback,
-            ):
-
-                while not stop_evt.is_set():
-
-                    # ---- LISTEN for speech ----
-
-                    recorded = []
-                    triggered = False
-                    silence_counter = 0
-                    listen_start = time.time()
-
-                    while not stop_evt.is_set():
-
-                        # Check idle timeout
-                        elapsed = time.time() - listen_start
-                        if elapsed > IDLE_TIMEOUT_S:
-                            print(
-                                f"⏳ Idle timeout "
-                                f"({IDLE_TIMEOUT_S}s). "
-                                f"Stopping."
-                            )
-                            asyncio.run(
-                                send_status("idle")
-                            )
-                            return
-
-                        try:
-                            chunk = audio_q.get(
-                                timeout=0.1
-                            )
-                        except queue.Empty:
-                            continue
-
-                        chunk = chunk.flatten()
-
-                        with torch.no_grad():
-                            speech_prob = vad_model(
-                                torch.from_numpy(chunk),
-                                SAMPLE_RATE,
-                            ).item()
-
-                        if speech_prob > VAD_THRESHOLD:
-                            if not triggered:
-                                triggered = True
-                                print(
-                                    "  ...speech started"
-                                )
-                            silence_counter = 0
-                        else:
-                            if triggered:
-                                silence_counter += 1
-
-                        if triggered:
-                            recorded.append(chunk)
-
-                            if (
-                                silence_counter
-                                > max_silence_chunks
-                            ):
-
-                                print(
-                                    "  ...speech finished"
-                                )
-
-                                utterance = (
-                                    np.concatenate(
-                                        recorded
-                                    )
-                                )
-
-                                # Run the full pipeline
-                                asyncio.run(
-                                    process_utterance(
-                                        utterance,
-                                        chat_history,
-                                    )
-                                )
-                                listen_start = time.time()
-
-                                break
-
-                    # After processing, loop continues
-                    # to listen again automatically
-
-        except Exception as e:
-            print(f"⚠️ Voice pipeline error: {e}")
-
-        finally:
-            print("Voice pipeline thread stopped.")
-
-    async def process_utterance(
-        utterance, chat_history
-    ):
-        """Transcribe → RAG → LLM → TTS → speak."""
+    async def handle_utterance(utterance):
+        nonlocal state, last_speech_time
 
         duration = len(utterance) / SAMPLE_RATE
         print(f"🎤 Captured {duration:.1f}s of audio")
 
         if duration < 0.3:
-            return  # too short, skip
+            state = "listening"
+            last_speech_time = time.time()
+            await safe_send_json({"status": "listening"})
+            return
 
-        # ---- Whisper transcription ----
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
 
-        await send_status("transcribing")
+        # 1. Transcribing
+        state = "processing"
+        await safe_send_json({"status": "transcribing"})
 
-        # Build WAV in memory
+        int16 = (np.clip(utterance, -1.0, 1.0) * 32767).astype(np.int16)
         wav_buf = io.BytesIO()
-        int16 = (
-            np.clip(utterance, -1.0, 1.0) * 32767
-        ).astype(np.int16)
-
         data_size = len(int16) * 2
         wav_buf.write(b"RIFF")
-        wav_buf.write(
-            struct.pack("<I", 36 + data_size)
-        )
+        wav_buf.write(struct.pack("<I", 36 + data_size))
         wav_buf.write(b"WAVE")
         wav_buf.write(b"fmt ")
         wav_buf.write(struct.pack("<I", 16))
-        wav_buf.write(
-            struct.pack(
-                "<HHIIHH",
-                1, 1, SAMPLE_RATE,
-                SAMPLE_RATE * 2, 2, 16,
-            )
-        )
+        wav_buf.write(struct.pack("<HHIIHH", 1, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16))
         wav_buf.write(b"data")
         wav_buf.write(struct.pack("<I", data_size))
         wav_buf.write(int16.tobytes())
         wav_buf.seek(0)
 
+        text = ""
+        whisper_lang = "en"
         try:
-            async with httpx.AsyncClient(
-                timeout=300.0
-            ) as client:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     WHISPER_SERVER_URL,
-                    files={
-                        "file": (
-                            "audio.wav",
-                            wav_buf,
-                            "audio/wav",
-                        ),
-                    },
-                    data={
-                        "response_format": (
-                            "verbose_json"
-                        ),
-                        "temperature": "0.0",
-                    },
+                    files={"file": ("audio.wav", wav_buf, "audio/wav")},
+                    data={"response_format": "verbose_json", "temperature": "0.0"},
                 )
                 resp.raise_for_status()
                 result = resp.json()
+                text = result.get("text", "").strip()
+                whisper_lang = str(result.get("language", "en")).lower()
         except Exception as e:
             print(f"⚠️ Whisper error: {e}")
+            state = "listening"
+            last_speech_time = time.time()
+            await safe_send_json({"status": "listening"})
             return
-
-        text = result.get("text", "").strip()
 
         if not text:
             print("No speech detected.")
+            state = "listening"
+            last_speech_time = time.time()
+            await safe_send_json({"status": "listening"})
             return
 
         print(f"📝 Transcribed: {text}")
 
-        # ---- LLM response (tools: web_search + rag_search) ----
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
 
-        await send_status("thinking")
+        # 2. LLM response (in worker thread to NEVER block asyncio keepalive)
+        await safe_send_json({"status": "thinking"})
 
-        llm = get_llm()
+        user_msg = format_user_message(text, whisper_lang=whisper_lang)
 
-        user_message = (
-            "[This request is in English. "
-            "Respond in the same language "
-            "as the user.]\n\n"
-            f"{text}"
-        )
+        try:
+            reply = await asyncio.to_thread(
+                llm.generate_response,
+                user_text=user_msg,
+                chat_history=chat_history,
+                stream=False,
+            )
+        except Exception as e:
+            print(f"⚠️ LLM error: {e}")
+            reply = "I encountered an error generating the response."
 
-        reply = ""
+        print(f"🤖 Reply: {reply[:100]}...")
 
-        for chunk in llm.generate_response(
-            user_text=user_message,
-            chat_history=chat_history,
-            stream=True,
-        ):
-            reply += chunk
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
 
-        print(f"🤖 Reply: {reply[:100]}")
+        await safe_send_json({"text": text, "reply": reply})
 
-        # Send text result to browser
-        await send_result(text, reply)
+        # 3. TTS response
+        state = "speaking"
+        await safe_send_json({"status": "speaking"})
 
-        # ---- TTS → play in browser ----
+        tts_text = _clean_for_tts(reply)
+        has_audio = False
 
-        # Clean markdown for TTS (same as legacy app)
-        def clean_for_tts(t):
-            if not t:
-                return t
-            t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
-            t = re.sub(r"\*(.+?)\*", r"\1", t)
-            t = re.sub(r"`([^`]+)`", r"\1", t)
-            t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
-            t = re.sub(r"https?://\S+", "", t)
-            t = re.sub(r"^#{1,6}\s+", "", t, flags=re.MULTILINE)
-            t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.MULTILINE)
-            t = re.sub(r"\s{2,}", " ", t)
-            t = t.replace("**", "").replace("__", "")
-            return t.strip()
+        if tts_text and ws.client_state == WebSocketState.CONNECTED:
+            voice = select_voice(tts_text)
+            print(f"🔊 Synthesizing TTS with voice: {voice}")
+            try:
+                communicate = edge_tts.Communicate(tts_text, voice)
+                await safe_send_json({"status": "tts_start"})
 
-        await send_status("speaking")
-        await send_tts_audio(clean_for_tts(reply))
+                async for tts_chunk in communicate.stream():
+                    if ws.client_state != WebSocketState.CONNECTED:
+                        break
+                    if tts_chunk["type"] == "audio":
+                        if await safe_send_bytes(tts_chunk["data"]):
+                            has_audio = True
 
-        # Done speaking, ready for next utterance
-        await send_status("listening")
+                await safe_send_json({"status": "tts_done"})
+            except Exception as e:
+                print(f"⚠️ TTS error: {e}")
 
-    # ---- main WebSocket handler ----
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
 
-    pipeline_thread = None
+        if has_audio:
+            state = "waiting_playback"
+            # Set a fallback timer in case client fails to send "ready"
+            asyncio.create_task(_playback_timeout_fallback())
+        else:
+            state = "listening"
+            last_speech_time = time.time()
+            await safe_send_json({"status": "listening"})
+
+    async def _playback_timeout_fallback():
+        nonlocal state, last_speech_time, vad_buffer, recorded_chunks, speech_triggered, silence_counter
+        await asyncio.sleep(25.0)  # Max playback time
+        if ws.client_state != WebSocketState.CONNECTED:
+            return
+        if state == "waiting_playback":
+            print("⏳ Playback timeout fallback, resuming listening")
+            vad_buffer = np.zeros(0, dtype=np.float32)
+            recorded_chunks.clear()
+            speech_triggered = False
+            silence_counter = 0
+            vad_model.reset_states()
+            last_speech_time = time.time()
+            state = "listening"
+            await safe_send_json({"status": "listening"})
 
     try:
-
         while True:
-            msg = await ws.receive()
+            try:
+                msg = await ws.receive()
+            except WebSocketDisconnect:
+                print("🔌 Voice WebSocket disconnected")
+                break
+            except RuntimeError as e:
+                if "disconnect message has been received" in str(e):
+                    print("🔌 Voice WebSocket closed (disconnect message received)")
+                    break
+                raise
 
-            if msg.get("type") != "websocket.receive":
+            msg_type = msg.get("type")
+
+            if msg_type == "websocket.disconnect":
+                print("🔌 Voice WebSocket received disconnect")
+                break
+
+            if msg_type not in ("websocket.receive",):
                 continue
 
+            # Binary: audio data from browser mic
+            if msg.get("bytes"):
+                # ONLY process audio when actively in "listening" state
+                if state != "listening":
+                    continue
+
+                raw = msg["bytes"]
+                int16 = np.frombuffer(raw, dtype=np.int16)
+                float32 = int16.astype(np.float32) / 32768.0
+
+                vad_buffer = np.concatenate([vad_buffer, float32])
+
+                while len(vad_buffer) >= VAD_CHUNK_SIZE:
+                    chunk = vad_buffer[:VAD_CHUNK_SIZE]
+                    vad_buffer = vad_buffer[VAD_CHUNK_SIZE:]
+
+                    with torch.no_grad():
+                        speech_prob = vad_model(
+                            torch.from_numpy(chunk),
+                            SAMPLE_RATE,
+                        ).item()
+
+                    if speech_prob > VAD_THRESHOLD:
+                        if not speech_triggered:
+                            speech_triggered = True
+                            print("  ...speech started")
+                        silence_counter = 0
+                    else:
+                        if speech_triggered:
+                            silence_counter += 1
+
+                    if speech_triggered:
+                        recorded_chunks.append(chunk)
+
+                        if silence_counter > max_silence_chunks:
+                            print("  ...speech finished")
+                            utterance = np.concatenate(recorded_chunks)
+
+                            # Immediately switch state so subsequent frames are dropped
+                            state = "processing"
+                            recorded_chunks.clear()
+                            vad_buffer = np.zeros(0, dtype=np.float32)
+                            speech_triggered = False
+                            silence_counter = 0
+
+                            # Run processing task asynchronously
+                            asyncio.create_task(handle_utterance(utterance))
+                            break
+
+                # Idle timeout check (ONLY when in listening mode and no active speech)
+                if state == "listening" and not speech_triggered:
+                    if time.time() - last_speech_time > IDLE_TIMEOUT_S:
+                        print(f"⏳ Idle timeout ({IDLE_TIMEOUT_S}s)")
+                        state = "idle"
+                        vad_buffer = np.zeros(0, dtype=np.float32)
+                        recorded_chunks.clear()
+                        speech_triggered = False
+                        silence_counter = 0
+                        await safe_send_json({"status": "idle"})
+
+                continue
+
+            # Text: JSON command from browser
             if msg.get("text"):
                 data = json.loads(msg["text"])
                 action = data.get("action")
 
                 if action == "start":
-                    if (
-                        pipeline_thread
-                        and pipeline_thread.is_alive()
-                    ):
-                        continue
+                    client_sid = data.get("session_id")
+                    if client_sid:
+                        session_id, session = _get_or_create_session(client_sid)
+                        chat_history = session["history"]
 
-                    stop_evt.clear()
-                    pipeline_thread = threading.Thread(
-                        target=voice_pipeline_thread,
-                        daemon=True,
-                    )
-                    pipeline_thread.start()
-                    await send_status("listening")
+                    state = "listening"
+                    vad_buffer = np.zeros(0, dtype=np.float32)
+                    recorded_chunks.clear()
+                    speech_triggered = False
+                    silence_counter = 0
+                    last_speech_time = time.time()
+                    vad_model.reset_states()
+
+                    await safe_send_json({"status": "listening", "session_id": session_id})
+                    print(f"🎙️ Voice session started (listening for user, session: {session_id})")
 
                 elif action == "stop":
-                    stop_evt.set()
-                    if pipeline_thread:
-                        pipeline_thread.join(timeout=2.0)
-                    pipeline_thread = None
-                    await send_status("idle")
+                    if state != "idle":
+                        state = "idle"
+                        vad_buffer = np.zeros(0, dtype=np.float32)
+                        recorded_chunks.clear()
+                        speech_triggered = False
+                        silence_counter = 0
+                        await safe_send_json({"status": "idle"})
+                        print("⏹️ Voice session stopped")
+
+                elif action in ("ready", "playback_done"):
+                    # Browser finished playing TTS audio; resume listening
+                    if state in ("waiting_playback", "speaking"):
+                        state = "listening"
+                        vad_buffer = np.zeros(0, dtype=np.float32)
+                        recorded_chunks.clear()
+                        speech_triggered = False
+                        silence_counter = 0
+                        last_speech_time = time.time()
+                        vad_model.reset_states()
+                        await safe_send_json({"status": "listening"})
+                        print("🎧 Playback finished, resumed listening")
 
     except WebSocketDisconnect:
         print("🔌 Voice WebSocket disconnected")
-        stop_evt.set()
     except Exception as e:
         print(f"⚠️ WebSocket error: {e}")
-        stop_evt.set()
 
 
 # ============================================================
@@ -818,8 +963,6 @@ async def websocket_voice(ws: WebSocket):
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(request: Request):
     """Serve the admin document management panel."""
-
-    # Check if already logged in
     token = request.cookies.get("admin_token")
     logged_in = token and token in _admin_tokens
 
@@ -835,7 +978,6 @@ async def admin_panel(request: Request):
 @app.post("/admin/login")
 async def admin_login(request: Request):
     """Authenticate admin with password."""
-
     body = await request.json()
     password = body.get("password", "")
 
@@ -859,10 +1001,8 @@ async def list_documents(
     _=Depends(verify_admin),
 ):
     """List all documents in the vector store."""
-
     store = get_store()
     docs = store.list_documents()
-
     return JSONResponse({"documents": docs})
 
 
@@ -873,8 +1013,6 @@ async def upload_document(
     _=Depends(verify_admin),
 ):
     """Upload and ingest a document (PDF/TXT)."""
-
-    # Save uploaded file
     upload_dir = os.path.join(
         os.path.dirname(__file__),
         "data",
@@ -882,75 +1020,27 @@ async def upload_document(
     )
     os.makedirs(upload_dir, exist_ok=True)
 
-    filepath = os.path.join(
-        upload_dir, file.filename
-    )
-
+    filepath = os.path.join(upload_dir, file.filename)
     with open(filepath, "wb") as f:
         content = await file.read()
         f.write(content)
 
-    # Ingest
     from rag.ingest import ingest_document
-
     store = get_store()
-
-    result = ingest_document(
-        filepath,
-        vector_store=store,
-    )
-
+    result = ingest_document(filepath, vector_store=store)
     return JSONResponse(result)
 
 
-@app.delete(
-    "/admin/api/documents/{doc_id}"
-)
+@app.delete("/admin/api/documents/{doc_id}")
 async def delete_document(
     doc_id: str,
     request: Request,
     _=Depends(verify_admin),
 ):
     """Delete a document and all its chunks."""
-
     store = get_store()
     store.delete_document(doc_id)
-
-    return JSONResponse(
-        {"status": "deleted", "doc_id": doc_id}
-    )
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-
-@app.on_event("startup")
-async def startup():
-    print(
-        "\n========================================"
-    )
-    print("  Government Scheme RAG Assistant")
-    print("========================================")
-    print(
-        f"  Chat UI:   http://localhost:5000/"
-    )
-    print(
-        f"  Admin:     http://localhost:5000/admin"
-    )
-    print(
-        f"  Password:  {ADMIN_PASSWORD}"
-    )
-    print(
-        "========================================\n"
-    )
-
-    # Preload embedding model at startup
-    from rag.embeddings import get_embedding_model
-    print("Preloading embedding model...")
-    get_embedding_model()
-    print("Embedding model ready.\n")
+    return JSONResponse({"status": "deleted", "doc_id": doc_id})
 
 
 # ============================================================

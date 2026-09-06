@@ -2,10 +2,29 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Government Scheme Assistant</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏛️</text></svg>">
     <style>
+        :root {
+            --bg-primary: #0a0f1a;
+            --bg-secondary: #111827;
+            --bg-card: #1a2235;
+            --bg-card-hover: #1f2a40;
+            --border: #2a3548;
+            --border-light: #374258;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --accent-glow: rgba(59, 130, 246, 0.15);
+            --danger: #ef4444;
+            --success: #22c55e;
+            --radius: 16px;
+            --radius-sm: 10px;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -13,620 +32,899 @@
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0f172a;
-            color: #e2e8f0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
             height: 100vh;
+            height: 100dvh;
             display: flex;
             flex-direction: column;
+            overflow: hidden;
         }
 
-        /* Header */
+        /* ==================== HEADER ==================== */
         .header {
-            background: #1e293b;
-            padding: 16px 24px;
-            border-bottom: 1px solid #334155;
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, #0d1424 100%);
+            padding: 14px 20px;
+            border-bottom: 1px solid var(--border);
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 14px;
+            flex-shrink: 0;
+            position: relative;
+            z-index: 10;
         }
 
-        .header-icon {
-            font-size: 28px;
+        .header-logo {
+            width: 42px;
+            height: 42px;
+            background: linear-gradient(135deg, var(--accent) 0%, #6366f1 100%);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.25);
         }
 
-        .header h1 {
-            font-size: 18px;
-            font-weight: 600;
-            color: #f1f5f9;
+        .header-text h1 {
+            font-size: 17px;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -0.3px;
         }
 
-        .header p {
+        .header-text p {
             font-size: 12px;
-            color: #94a3b8;
+            color: var(--text-secondary);
+            margin-top: 1px;
         }
 
-        /* Chat area */
+        .header-actions {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-new-chat {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            padding: 7px 14px;
+            border-radius: 8px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .btn-new-chat:hover {
+            background: var(--bg-card-hover);
+            color: var(--text-primary);
+            border-color: var(--border-light);
+        }
+
+        /* ==================== CHAT AREA ==================== */
         .chat-container {
             flex: 1;
             overflow-y: auto;
-            padding: 24px;
+            padding: 20px;
             display: flex;
             flex-direction: column;
+            gap: 12px;
+            scroll-behavior: smooth;
+        }
+
+        .chat-container::-webkit-scrollbar {
+            width: 6px;
+        }
+        .chat-container::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .chat-container::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        /* Welcome screen */
+        .welcome {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 40px 20px;
             gap: 16px;
         }
 
-        .message {
-            max-width: 75%;
-            padding: 12px 16px;
-            border-radius: 16px;
-            line-height: 1.5;
-            font-size: 15px;
-            animation: fadeIn 0.3s ease;
+        .welcome-icon {
+            width: 72px;
+            height: 72px;
+            background: linear-gradient(135deg, var(--accent), #8b5cf6);
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 36px;
+            box-shadow: 0 8px 32px rgba(59, 130, 246, 0.2);
+            margin-bottom: 8px;
         }
 
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(8px); }
-            to { opacity: 1; transform: translateY(0); }
+        .welcome h2 {
+            font-size: 26px;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -0.5px;
+        }
+
+        .welcome p {
+            font-size: 15px;
+            color: var(--text-secondary);
+            max-width: 420px;
+            line-height: 1.6;
+        }
+
+        .welcome-hints {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: center;
+            margin-top: 8px;
+        }
+
+        .hint-chip {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 13px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .hint-chip:hover {
+            background: var(--bg-card-hover);
+            border-color: var(--accent);
+            color: var(--text-primary);
+        }
+
+        /* Messages */
+        .message {
+            max-width: 80%;
+            padding: 14px 18px;
+            border-radius: var(--radius);
+            line-height: 1.65;
+            font-size: 14.5px;
+            animation: msgIn 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+            position: relative;
+        }
+
+        @keyframes msgIn {
+            from { opacity: 0; transform: translateY(12px) scale(0.97); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
         }
 
         .message.user {
             align-self: flex-end;
-            background: #2563eb;
+            background: linear-gradient(135deg, var(--accent), #4f46e5);
             color: white;
-            border-bottom-right-radius: 4px;
+            border-bottom-right-radius: 6px;
+            box-shadow: 0 2px 8px rgba(59, 130, 246, 0.2);
         }
 
         .message.assistant {
             align-self: flex-start;
-            background: #1e293b;
+            background: var(--bg-card);
+            color: var(--text-primary);
+            border-bottom-left-radius: 6px;
+            border: 1px solid var(--border);
+        }
+
+        .message.assistant .msg-content {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .message.assistant .msg-content strong {
             color: #e2e8f0;
-            border-bottom-left-radius: 4px;
-            border: 1px solid #334155;
+            font-weight: 600;
         }
 
-        .message.assistant .sources {
-            margin-top: 8px;
-            padding-top: 8px;
-            border-top: 1px solid #334155;
-            font-size: 12px;
-            color: #94a3b8;
-        }
-
-        .message.assistant .sources span {
-            display: inline-block;
-            background: #334155;
-            padding: 2px 8px;
+        .message.assistant .msg-content code {
+            background: rgba(255,255,255,0.06);
+            padding: 2px 6px;
             border-radius: 4px;
-            margin: 2px 4px 2px 0;
+            font-size: 13px;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
         }
 
-        .welcome {
-            text-align: center;
-            padding: 60px 20px;
-            color: #64748b;
-        }
-
-        .welcome h2 {
-            font-size: 24px;
-            margin-bottom: 8px;
-            color: #94a3b8;
-        }
-
-        .welcome p {
-            font-size: 14px;
-        }
-
-        /* Input area */
-        .input-area {
-            background: #1e293b;
-            padding: 16px 24px;
-            border-top: 1px solid #334155;
+        /* Typing indicator */
+        .typing-indicator {
             display: flex;
+            gap: 5px;
+            padding: 16px 20px;
             align-items: center;
-            gap: 12px;
         }
 
-        .text-input {
-            flex: 1;
-            background: #0f172a;
-            border: 1px solid #334155;
-            border-radius: 24px;
-            padding: 12px 20px;
-            color: #e2e8f0;
-            font-size: 15px;
-            outline: none;
-            transition: border-color 0.2s;
-        }
-
-        .text-input:focus {
-            border-color: #2563eb;
-        }
-
-        .text-input::placeholder {
-            color: #64748b;
-        }
-
-        /* Mic button */
-        .mic-btn {
-            width: 48px;
-            height: 48px;
+        .typing-indicator span {
+            width: 8px;
+            height: 8px;
+            background: var(--text-muted);
             border-radius: 50%;
-            border: none;
-            background: #2563eb;
-            color: white;
-            font-size: 20px;
-            cursor: pointer;
+            animation: typingBounce 1.4s infinite ease-in-out;
+        }
+
+        .typing-indicator span:nth-child(2) { animation-delay: 0.15s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.3s; }
+
+        @keyframes typingBounce {
+            0%, 80%, 100% { transform: scale(0.7); opacity: 0.4; }
+            40% { transform: scale(1); opacity: 1; }
+        }
+
+        /* ==================== INPUT AREA ==================== */
+        .input-area {
+            background: var(--bg-secondary);
+            padding: 14px 16px;
+            border-top: 1px solid var(--border);
             display: flex;
             align-items: center;
-            justify-content: center;
-            transition: all 0.2s;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        .input-wrapper {
+            flex: 1;
             position: relative;
         }
 
-        .mic-btn:hover {
-            background: #1d4ed8;
-            transform: scale(1.05);
+        .text-input {
+            width: 100%;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 13px 18px;
+            color: var(--text-primary);
+            font-size: 14.5px;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            font-family: inherit;
         }
 
-        .mic-btn.recording {
-            background: #dc2626;
-            animation: pulse 1.5s infinite;
+        .text-input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
         }
 
-        @keyframes pulse {
-            0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.4); }
-            50% { box-shadow: 0 0 0 12px rgba(220, 38, 38, 0); }
+        .text-input::placeholder {
+            color: var(--text-muted);
         }
 
-        .send-btn {
-            width: 48px;
-            height: 48px;
-            border-radius: 50%;
+        /* Buttons */
+        .btn-icon {
+            width: 46px;
+            height: 46px;
+            border-radius: 13px;
             border: none;
-            background: #2563eb;
-            color: white;
-            font-size: 18px;
-            cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
+            cursor: pointer;
             transition: all 0.2s;
+            flex-shrink: 0;
+            font-size: 19px;
+        }
+
+        .send-btn {
+            background: var(--accent);
+            color: white;
         }
 
         .send-btn:hover {
-            background: #1d4ed8;
+            background: var(--accent-hover);
+            transform: scale(1.04);
         }
 
         .send-btn:disabled {
-            background: #334155;
+            background: var(--bg-card);
+            color: var(--text-muted);
             cursor: not-allowed;
+            transform: none;
         }
 
-        /* Status bar */
-        .status {
-            padding: 8px 24px;
-            font-size: 12px;
-            color: #64748b;
-            background: #0f172a;
-            border-top: 1px solid #1e293b;
+        .mic-btn {
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .mic-btn:hover {
+            background: var(--bg-card-hover);
+            color: var(--text-primary);
+            border-color: var(--border-light);
+        }
+
+        .mic-btn.active {
+            background: var(--danger);
+            color: white;
+            border-color: var(--danger);
+            animation: micPulse 2s infinite;
+        }
+
+        @keyframes micPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            50% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+        }
+
+        /* ==================== STATUS BAR ==================== */
+        .status-bar {
+            padding: 6px 20px;
+            font-size: 11px;
+            color: var(--text-muted);
+            background: var(--bg-primary);
+            border-top: 1px solid rgba(42, 53, 72, 0.5);
             display: flex;
             justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
 
         .status-dot {
-            display: inline-block;
-            width: 8px;
-            height: 8px;
+            width: 7px;
+            height: 7px;
             border-radius: 50%;
-            margin-right: 6px;
+            background: var(--success);
+            transition: background 0.3s;
         }
 
-        .status-dot.online { background: #22c55e; }
-        .status-dot.offline { background: #ef4444; }
+        .status-dot.offline { background: var(--danger); }
+        .status-dot.processing { background: #f59e0b; animation: statusPulse 1s infinite; }
 
-        /* Loading indicator */
-        .typing {
-            display: flex;
-            gap: 4px;
-            padding: 8px 0;
+        @keyframes statusPulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
         }
 
-        .typing span {
-            width: 8px;
-            height: 8px;
-            background: #64748b;
-            border-radius: 50%;
-            animation: bounce 1.4s infinite;
+        .status-bar a {
+            color: var(--text-muted);
+            text-decoration: none;
+            transition: color 0.2s;
         }
 
-        .typing span:nth-child(2) { animation-delay: 0.2s; }
-        .typing span:nth-child(3) { animation-delay: 0.4s; }
+        .status-bar a:hover { color: var(--text-secondary); }
 
-        @keyframes bounce {
-            0%, 80%, 100% { transform: translateY(0); }
-            40% { transform: translateY(-8px); }
+        /* ==================== RESPONSIVE ==================== */
+        @media (max-width: 640px) {
+            .header { padding: 12px 16px; }
+            .header-text h1 { font-size: 15px; }
+            .chat-container { padding: 14px; }
+            .message { max-width: 90%; padding: 12px 14px; font-size: 14px; }
+            .input-area { padding: 10px 12px; }
+            .btn-new-chat span { display: none; }
+            .welcome h2 { font-size: 22px; }
+            .welcome-hints { flex-direction: column; align-items: center; }
         }
     </style>
 </head>
 <body>
 
     <div class="header">
-        <span class="header-icon">🏛️</span>
-        <div>
-            <h1>Government Scheme Assistant</h1>
-            <p>Ask about government schemes in any language</p>
+        <div class="header-logo">🏛️</div>
+        <div class="header-text">
+            <h1>Scheme Assistant</h1>
+            <p>Ask in any language — English, Hindi, Tamil & more</p>
+        </div>
+        <div class="header-actions">
+            <button class="btn-new-chat" id="newChatBtn" title="Start new conversation">
+                <span>New Chat</span> ✦
+            </button>
         </div>
     </div>
 
     <div class="chat-container" id="chatContainer">
         <div class="welcome" id="welcome">
+            <div class="welcome-icon">🏛️</div>
             <h2>How can I help you?</h2>
-            <p>Ask about any government scheme — eligibility, benefits, how to apply.<br>
-            You can speak in English, Hindi, Tamil, or any language.</p>
+            <p>Ask about any government scheme — eligibility, benefits, how to apply. Speak or type in any language.</p>
+            <div class="welcome-hints">
+                <div class="hint-chip" onclick="askHint(this)">What schemes are available for farmers?</div>
+                <div class="hint-chip" onclick="askHint(this)">PM Kisan eligibility</div>
+                <div class="hint-chip" onclick="askHint(this)">Ration card apply pandrathu eppadi?</div>
+            </div>
         </div>
     </div>
 
     <div class="input-area">
-        <input
-            type="text"
-            class="text-input"
-            id="textInput"
-            placeholder="Type your question..."
-            autocomplete="off"
-        >
-        <button class="send-btn" id="sendBtn" disabled title="Send">➤</button>
-        <button class="mic-btn" id="micBtn" title="Click to start conversation">🎤</button>
+        <button class="btn-icon mic-btn" id="micBtn" title="Hold to speak">🎤</button>
+        <div class="input-wrapper">
+            <input
+                type="text"
+                class="text-input"
+                id="textInput"
+                placeholder="Type your question..."
+                autocomplete="off"
+            >
+        </div>
+        <button class="btn-icon send-btn" id="sendBtn" disabled title="Send">➤</button>
     </div>
 
-    <div class="status">
-        <span>
-            <span class="status-dot online" id="statusDot"></span>
+    <div class="status-bar">
+        <div class="status-indicator">
+            <div class="status-dot" id="statusDot"></div>
             <span id="statusText">Ready</span>
-        </span>
-        <span>Admin: <a href="/admin" style="color:#64748b">/admin</a></span>
+        </div>
+        <a href="/admin">Admin Panel</a>
     </div>
 
     <script>
-        const chatContainer = document.getElementById('chatContainer');
-        const textInput = document.getElementById('textInput');
-        const sendBtn = document.getElementById('sendBtn');
-        const micBtn = document.getElementById('micBtn');
-        const welcome = document.getElementById('welcome');
-        const statusText = document.getElementById('statusText');
+    // ============================================================
+    // DOM
+    // ============================================================
+    const chatContainer = document.getElementById('chatContainer');
+    const textInput = document.getElementById('textInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const micBtn = document.getElementById('micBtn');
+    const welcome = document.getElementById('welcome');
+    const statusText = document.getElementById('statusText');
+    const statusDot = document.getElementById('statusDot');
+    const newChatBtn = document.getElementById('newChatBtn');
 
-        let chatHistory = [];
-        let ws = null;
-        let isConversationActive = false;
-        let ttsAudioQueue = [];
-        let isPlayingTTS = false;
+    function generateSessionId() {
+        return 'sess_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+    }
 
-        // ========== WEBSOCKET ==========
-        function connectVoiceSocket() {
-            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${location.host}/ws/voice`);
+    let sessionId = generateSessionId();
+    let ws = null;
+    let isVoiceActive = false;
+    let isListeningState = false;
+    let audioCtx = null;
+    let micStream = null;
+    let workletNode = null;
+    let ttsChunks = [];
+    let currentTtsAudio = null;
 
-            ws.onopen = () => {
-                console.log('🔌 Voice socket connected');
-                updateStatus('ready');
-            };
-
-            ws.onclose = () => {
-                console.log('🔌 Voice socket disconnected, reconnecting...');
-                updateStatus('offline');
-                setTimeout(connectVoiceSocket, 2000);
-            };
-
-            ws.onmessage = (event) => {
-                if (event.data instanceof Blob) {
-                    // Binary message: TTS audio chunk
-                    handleTTSAudioChunk(event.data);
-                    return;
-                }
-
-                const data = JSON.parse(event.data);
-
-                // Status updates
-                if (data.status) {
-                    switch (data.status) {
-                        case 'listening':
-                            updateStatus('listening');
-                            break;
-                        case 'transcribing':
-                            updateStatus('processing');
-                            break;
-                        case 'thinking':
-                            updateStatus('thinking');
-                            break;
-                        case 'speaking':
-                            updateStatus('speaking');
-                            break;
-                        case 'idle':
-                            // Server timed out, reset browser UI
-                            isConversationActive = false;
-                            micBtn.classList.remove('recording');
-                            micBtn.innerHTML = '🎤';
-                            updateStatus('ready');
-                            break;
-                        case 'tts_audio':
-                            // TTS starting, prepare queue
-                            ttsAudioQueue = [];
-                            isPlayingTTS = true;
-                            break;
-                        case 'tts_done':
-                            // All TTS chunks received, play them
-                            playTTSAudioQueue();
-                            break;
-                    }
-                    return;
-                }
-
-                // Conversation result
-                if (data.text !== undefined && data.reply !== undefined) {
-                    if (welcome) welcome.style.display = 'none';
-                    if (data.text) {
-                        addMessage(data.text, 'user');
-                        chatHistory.push({ role: 'user', content: data.text });
-                    }
-                    if (data.reply) {
-                        addMessage(data.reply, 'assistant');
-                        chatHistory.push({ role: 'assistant', content: data.reply });
-                        if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
-                    }
-                }
-
-                // Errors
-                if (data.error) {
-                    console.log('Error:', data.error);
-                }
-            };
+    // ============================================================
+    // WEBSOCKET
+    // ============================================================
+    function connectVoiceSocket() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+            return;
         }
 
-        connectVoiceSocket();
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${location.host}/ws/voice?session_id=${encodeURIComponent(sessionId)}`);
 
-        // ========== TTS AUDIO PLAYBACK ==========
-        function handleTTSAudioChunk(blob) {
-            ttsAudioQueue.push(blob);
-        }
+        ws.binaryType = 'arraybuffer';
 
-        async function playTTSAudioQueue() {
-            if (ttsAudioQueue.length === 0) return;
+        ws.onopen = () => {
+            console.log('Voice socket connected');
+            setStatus('ready');
+        };
 
-            // Concatenate all chunks into one blob
-            const chunks = ttsAudioQueue;
-            ttsAudioQueue = [];
-
-            const fullBlob = new Blob(chunks, { type: 'audio/mpeg' });
-            const url = URL.createObjectURL(fullBlob);
-            const audio = new Audio(url);
-
-            await new Promise((resolve) => {
-                audio.onended = () => {
-                    URL.revokeObjectURL(url);
-                    resolve();
-                };
-                audio.onerror = () => {
-                    URL.revokeObjectURL(url);
-                    resolve();
-                };
-                audio.play();
-            });
-
-            isPlayingTTS = false;
-        }
-
-        // Enable send button when text is entered
-        textInput.addEventListener('input', () => {
-            sendBtn.disabled = !textInput.value.trim();
-        });
-
-        // Send on Enter
-        textInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                if (textInput.value.trim()) sendMessage();
+        ws.onclose = () => {
+            console.log('Voice socket disconnected');
+            isListeningState = false;
+            setStatus('offline');
+            if (isVoiceActive) {
+                setTimeout(connectVoiceSocket, 1500);
             }
-        });
+        };
 
-        sendBtn.addEventListener('click', sendMessage);
+        ws.onerror = (e) => {
+            console.error('WebSocket error:', e);
+        };
 
-        // ========== TEXT CHAT ==========
-        async function sendMessage() {
-            const text = textInput.value.trim();
-            if (!text) return;
-
-            textInput.value = '';
-            sendBtn.disabled = true;
-
-            // Hide welcome
-            if (welcome) welcome.style.display = 'none';
-
-            // Add user message
-            addMessage(text, 'user');
-
-            // Show typing indicator
-            const typingEl = addTyping();
-
-            // Stream response
-            statusText.textContent = 'Thinking...';
-
-            try {
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        message: text,
-                        history: chatHistory,
-                    }),
-                });
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-
-                let replyText = '';
-                let sources = [];
-
-                // Remove typing indicator
-                typingEl.remove();
-
-                // Create assistant message element
-                const assistantEl = createMessageElement('', 'assistant');
-                chatContainer.appendChild(assistantEl);
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    const chunk = decoder.decode(value);
-                    const lines = chunk.split('\n');
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const data = JSON.parse(line.slice(6));
-
-                                if (data.text) {
-                                    replyText += data.text;
-                                    assistantEl.querySelector('.text').textContent = replyText;
-                                    chatContainer.scrollTop = chatContainer.scrollHeight;
-                                }
-
-                                if (data.sources) {
-                                    sources = data.sources;
-                                }
-
-                                if (data.done) {
-                                    // Add sources
-                                    if (sources.length > 0) {
-                                        const sourcesEl = document.createElement('div');
-                                        sourcesEl.className = 'sources';
-                                        sourcesEl.innerHTML = 'Sources: ' +
-                                            sources.map(s => `<span>${s.filename}</span>`).join('');
-                                        assistantEl.appendChild(sourcesEl);
-                                    }
-                                }
-                            } catch (e) {}
-                        }
-                    }
-                }
-
-                // Update history
-                chatHistory.push({ role: 'user', content: text });
-                chatHistory.push({ role: 'assistant', content: replyText });
-
-                // Keep history manageable (last 10 turns)
-                if (chatHistory.length > 20) {
-                    chatHistory = chatHistory.slice(-20);
-                }
-
-            } catch (error) {
-                typingEl.remove();
-                addMessage('Sorry, something went wrong. Please try again.', 'assistant');
-            }
-
-            statusText.textContent = 'Ready';
-        }
-
-        // ========== VOICE INPUT (backend owns the mic) ==========
-        micBtn.addEventListener('click', toggleConversation);
-
-        function toggleConversation() {
-            if (isConversationActive) {
-                stopConversation();
-            } else {
-                startConversation();
-            }
-        }
-
-        function startConversation() {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                addMessage('Voice connection not ready. Please wait...', 'assistant');
+        ws.onmessage = async (event) => {
+            // Binary: TTS audio chunk (MP3)
+            if (event.data instanceof ArrayBuffer) {
+                ttsChunks.push(new Uint8Array(event.data));
                 return;
             }
 
-            isConversationActive = true;
-            micBtn.classList.add('recording');
-            micBtn.innerHTML = '⏹️';
+            const data = JSON.parse(event.data);
 
-            // Tell server to start listening
-            ws.send(JSON.stringify({ action: 'start' }));
-        }
-
-        function stopConversation() {
-            isConversationActive = false;
-            micBtn.classList.remove('recording');
-            micBtn.innerHTML = '🎤';
-
-            // Stop any playing TTS
-            isPlayingTTS = false;
-
-            // Tell server to stop
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ action: 'stop' }));
+            if (data.session_id) {
+                sessionId = data.session_id;
             }
-        }
 
-        // ========== HELPERS ==========
-        function updateStatus(state) {
-            const dot = document.getElementById('statusDot');
-            const text = document.getElementById('statusText');
-
-            switch (state) {
-                case 'ready':
-                    dot.className = 'status-dot online';
-                    text.textContent = isConversationActive ? 'Active — speak now' : 'Ready';
-                    break;
-                case 'listening':
-                    dot.className = 'status-dot online';
-                    text.textContent = 'Listening...';
-                    break;
-                case 'processing':
-                    dot.className = 'status-dot online';
-                    text.textContent = 'Transcribing...';
-                    break;
-                case 'thinking':
-                    dot.className = 'status-dot online';
-                    text.textContent = 'Thinking...';
-                    break;
-                case 'speaking':
-                    dot.className = 'status-dot online';
-                    text.textContent = 'Speaking...';
-                    break;
-                case 'offline':
-                    dot.className = 'status-dot offline';
-                    text.textContent = 'Disconnected';
-                    break;
+            // Status updates
+            if (data.status) {
+                switch (data.status) {
+                    case 'listening':
+                        isListeningState = true;
+                        setStatus('listening');
+                        break;
+                    case 'transcribing':
+                        isListeningState = false;
+                        setStatus('transcribing');
+                        break;
+                    case 'thinking':
+                        isListeningState = false;
+                        setStatus('thinking');
+                        break;
+                    case 'speaking':
+                        isListeningState = false;
+                        setStatus('speaking');
+                        break;
+                    case 'idle':
+                        isListeningState = false;
+                        stopVoice(false);
+                        setStatus('ready');
+                        break;
+                    case 'tts_start':
+                        isListeningState = false;
+                        ttsChunks = [];
+                        break;
+                    case 'tts_done':
+                        isListeningState = false;
+                        await playTTS();
+                        if (ws && ws.readyState === WebSocket.OPEN && isVoiceActive) {
+                            ws.send(JSON.stringify({ action: 'ready' }));
+                        }
+                        break;
+                }
+                return;
             }
+
+            // Conversation result
+            if (data.text !== undefined && data.reply !== undefined) {
+                hideWelcome();
+                if (data.text) addMessage(data.text, 'user');
+                if (data.reply) addMessage(data.reply, 'assistant');
+            }
+
+            // Errors
+            if (data.error) {
+                console.log('Server error:', data.error);
+            }
+        };
+    }
+
+    connectVoiceSocket();
+
+    // ============================================================
+    // TTS PLAYBACK (MP3 from edge-tts)
+    // ============================================================
+    async function playTTS() {
+        if (ttsChunks.length === 0) return;
+
+        const totalLen = ttsChunks.reduce((s, c) => s + c.length, 0);
+        const combined = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const chunk of ttsChunks) {
+            combined.set(chunk, offset);
+            offset += chunk.length;
+        }
+        ttsChunks = [];
+
+        const blob = new Blob([combined], { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+        currentTtsAudio = new Audio(url);
+
+        try {
+            await new Promise((resolve) => {
+                currentTtsAudio.onended = resolve;
+                currentTtsAudio.onerror = resolve;
+                currentTtsAudio.play().catch(resolve);
+            });
+        } catch (e) {
+            console.warn('TTS playback error:', e);
+        } finally {
+            URL.revokeObjectURL(url);
+            currentTtsAudio = null;
+        }
+    }
+
+    // ============================================================
+    // BROWSER MIC CAPTURE (AudioWorklet → WebSocket)
+    // ============================================================
+    async function startMicCapture() {
+        try {
+            micStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    sampleRate: 16000,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                }
+            });
+
+            audioCtx = new AudioContext({ sampleRate: 16000 });
+            await audioCtx.audioWorklet.addModule('/audio-processor.js');
+
+            const source = audioCtx.createMediaStreamSource(micStream);
+            workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
+
+            // ONLY send PCM chunks when actively in listening state
+            workletNode.port.onmessage = (e) => {
+                if (ws && ws.readyState === WebSocket.OPEN && isVoiceActive && isListeningState) {
+                    ws.send(e.data);
+                }
+            };
+
+            source.connect(workletNode);
+            return true;
+        } catch (err) {
+            console.error('Mic capture failed:', err);
+            addMessage('Could not access microphone. Please allow microphone access and try again.', 'assistant');
+            return false;
+        }
+    }
+
+    function stopMicCapture() {
+        if (workletNode) {
+            workletNode.disconnect();
+            workletNode = null;
+        }
+        if (audioCtx) {
+            audioCtx.close().catch(() => {});
+            audioCtx = null;
+        }
+        if (micStream) {
+            micStream.getTracks().forEach(t => t.stop());
+            micStream = null;
+        }
+    }
+
+    // ============================================================
+    // VOICE TOGGLE
+    // ============================================================
+    micBtn.addEventListener('click', toggleVoice);
+
+    async function toggleVoice() {
+        if (isVoiceActive) {
+            stopVoice();
+        } else {
+            await startVoice();
+        }
+    }
+
+    async function startVoice() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            addMessage('Voice connection not ready. Please wait...', 'assistant');
+            return;
         }
 
-        function addMessage(text, role) {
-            const el = createMessageElement(text, role);
-            chatContainer.appendChild(el);
+        hideWelcome();
+
+        const ok = await startMicCapture();
+        if (!ok) return;
+
+        isVoiceActive = true;
+        micBtn.classList.add('active');
+        micBtn.innerHTML = '⏹';
+        micBtn.title = 'Stop voice';
+
+        // Tell server to start processing
+        ws.send(JSON.stringify({ action: 'start', session_id: sessionId }));
+    }
+
+    function stopVoice(notifyServer = true) {
+        isVoiceActive = false;
+        isListeningState = false;
+        micBtn.classList.remove('active');
+        micBtn.innerHTML = '🎤';
+        micBtn.title = 'Start voice';
+
+        // Stop TTS
+        if (currentTtsAudio) {
+            currentTtsAudio.pause();
+            currentTtsAudio = null;
+        }
+
+        stopMicCapture();
+
+        if (notifyServer && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ action: 'stop' }));
+        }
+
+        setStatus('ready');
+    }
+
+    // ============================================================
+    // TEXT CHAT (SSE)
+    // ============================================================
+    textInput.addEventListener('input', () => {
+        sendBtn.disabled = !textInput.value.trim();
+    });
+
+    textInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            if (textInput.value.trim()) sendTextMessage();
+        }
+    });
+
+    sendBtn.addEventListener('click', sendTextMessage);
+
+    async function sendTextMessage() {
+        const text = textInput.value.trim();
+        if (!text) return;
+
+        textInput.value = '';
+        sendBtn.disabled = true;
+        hideWelcome();
+        addMessage(text, 'user');
+
+        const typingEl = addTypingIndicator();
+        setStatus('thinking');
+
+        try {
+            const response = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    message: text,
+                    session_id: sessionId,
+                }),
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+
+            let replyText = '';
+            let assistantEl = null;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value);
+                const lines = chunk.split('\n');
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const payload = line.slice(6);
+                    if (payload === '[DONE]') continue;
+
+                    try {
+                        const data = JSON.parse(payload);
+
+                        if (data.session_id) {
+                            sessionId = data.session_id;
+                        }
+
+                        if (data.text) {
+                            if (!assistantEl) {
+                                typingEl.remove();
+                                assistantEl = addMessage('', 'assistant');
+                            }
+                            replyText += data.text;
+                            const contentEl = assistantEl.querySelector('.msg-content');
+                            contentEl.textContent = replyText;
+                            scrollToBottom();
+                        }
+                    } catch (e) {}
+                }
+            }
+
+            if (!assistantEl && replyText === '') {
+                typingEl.remove();
+            }
+
+        } catch (error) {
+            typingEl.remove();
+            addMessage('Sorry, something went wrong. Please try again.', 'assistant');
+        }
+
+        setStatus('ready');
+    }
+
+    // ============================================================
+    // HINT CHIPS
+    // ============================================================
+    function askHint(el) {
+        textInput.value = el.textContent;
+        sendBtn.disabled = false;
+        textInput.focus();
+    }
+
+    // ============================================================
+    // NEW CHAT
+    // ============================================================
+    newChatBtn.addEventListener('click', () => {
+        sessionId = generateSessionId();
+        chatContainer.innerHTML = '';
+        if (ws) {
+            ws.close();
+            setTimeout(connectVoiceSocket, 300);
+        }
+        const welcomeHtml = `
+            <div class="welcome" id="welcome">
+                <div class="welcome-icon">🏛️</div>
+                <h2>How can I help you?</h2>
+                <p>Ask about any government scheme — eligibility, benefits, how to apply. Speak or type in any language.</p>
+                <div class="welcome-hints">
+                    <div class="hint-chip" onclick="askHint(this)">What schemes are available for farmers?</div>
+                    <div class="hint-chip" onclick="askHint(this)">PM Kisan eligibility</div>
+                    <div class="hint-chip" onclick="askHint(this)">Ration card apply pandrathu eppadi?</div>
+                </div>
+            </div>
+        `;
+        chatContainer.innerHTML = welcomeHtml;
+        textInput.focus();
+    });
+
+    // ============================================================
+    // HELPERS
+    // ============================================================
+    function setStatus(state) {
+        switch (state) {
+            case 'ready':
+                statusDot.className = 'status-dot';
+                statusText.textContent = isVoiceActive ? 'Voice active — speak now' : 'Ready';
+                break;
+            case 'listening':
+                statusDot.className = 'status-dot';
+                statusText.textContent = '🎤 Listening...';
+                break;
+            case 'transcribing':
+                statusDot.className = 'status-dot processing';
+                statusText.textContent = 'Transcribing speech...';
+                break;
+            case 'thinking':
+                statusDot.className = 'status-dot processing';
+                statusText.textContent = 'Thinking...';
+                break;
+            case 'speaking':
+                statusDot.className = 'status-dot';
+                statusText.textContent = '🔊 Speaking...';
+                break;
+            case 'offline':
+                statusDot.className = 'status-dot offline';
+                statusText.textContent = 'Reconnecting...';
+                break;
+        }
+    }
+
+    function hideWelcome() {
+        const w = document.getElementById('welcome');
+        if (w) w.remove();
+    }
+
+    function addMessage(text, role) {
+        const div = document.createElement('div');
+        div.className = `message ${role}`;
+        div.innerHTML = `<div class="msg-content">${escapeHtml(text)}</div>`;
+        chatContainer.appendChild(div);
+        scrollToBottom();
+        return div;
+    }
+
+    function addTypingIndicator() {
+        const div = document.createElement('div');
+        div.className = 'message assistant';
+        div.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+        chatContainer.appendChild(div);
+        scrollToBottom();
+        return div;
+    }
+
+    function scrollToBottom() {
+        requestAnimationFrame(() => {
             chatContainer.scrollTop = chatContainer.scrollHeight;
-            return el;
-        }
+        });
+    }
 
-        function createMessageElement(text, role) {
-            const div = document.createElement('div');
-            div.className = `message ${role}`;
-            div.innerHTML = `<div class="text">${escapeHtml(text)}</div>`;
-            return div;
-        }
-
-        function addTyping() {
-            const div = document.createElement('div');
-            div.className = 'message assistant';
-            div.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
-            chatContainer.appendChild(div);
-            chatContainer.scrollTop = chatContainer.scrollHeight;
-            return div;
-        }
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
     </script>
 </body>
 </html>

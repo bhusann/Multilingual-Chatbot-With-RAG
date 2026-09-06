@@ -41,6 +41,7 @@ MAX_TOKENS = 1200
 TEMPERATURE = 0.3
 MAX_SEARCH_ROUNDS = 6  # max number of tool-call rounds per user query
 MAX_PARALLEL_SEARCHES = 4  # searches run concurrently within one round
+MAX_HISTORY_TURNS = 8  # max conversation turns to keep in history
 
 
 # ============================================================
@@ -394,28 +395,51 @@ FINAL ANSWER RULES
   clearly.
 """
 
-    def _run_agent_loop(self, system_prompt, user_text, prior_turns, cancel_event=None, stream=False, rag_context=None):
+    def _trim_history(self, chat_history):
+        """
+        Trim old turns from history while keeping system prompt.
+
+        Keeps the last MAX_HISTORY_TURNS user turns with all their
+        associated tool calls, tool results, and assistant replies.
+        This preserves the exact message sequence for KV cache hits.
+        """
+        if len(chat_history) <= 2:
+            return
+
+        user_indices = [
+            i for i, m in enumerate(chat_history)
+            if m.get("role") == "user"
+        ]
+
+        if len(user_indices) <= MAX_HISTORY_TURNS:
+            return
+
+        keep_from = user_indices[-MAX_HISTORY_TURNS]
+        del chat_history[1:keep_from]
+
+    def _run_agent_loop(
+        self, system_prompt, user_text, prior_turns,
+        cancel_event=None, stream=False,
+        rag_context=None, new_messages=None,
+    ):
         """
         Run the tool-calling loop until the model answers or the
         round limit is reached. Returns the final text reply.
 
-        If stream=True, the FINAL answer is streamed to stdout.
-        Tool-call rounds are never streamed.
+        If new_messages is provided (a list), all new messages
+        generated during this turn (user, tool calls, tool results,
+        assistant) are appended to it for history tracking.
         """
 
         messages = [
             {"role": "system", "content": system_prompt},
         ]
-
-        # Prior multi-turn context (user/assistant pairs)
         messages.extend(prior_turns)
 
-        messages.append(
-            {
-                "role": "user",
-                "content": user_text,
-            }
-        )
+        user_msg = {"role": "user", "content": user_text}
+        messages.append(user_msg)
+        if new_messages is not None:
+            new_messages.append(user_msg)
 
         for _ in range(MAX_SEARCH_ROUNDS):
 
@@ -425,7 +449,6 @@ FINAL ANSWER RULES
             ):
                 return ""
 
-            # Tool-call rounds: non-streaming
             response = (
                 self.client
                 .chat
@@ -454,10 +477,15 @@ FINAL ANSWER RULES
                 reply = (message.content or "").strip()
 
                 if reply:
+                    if new_messages is not None:
+                        new_messages.append(
+                            {"role": "assistant", "content": reply}
+                        )
                     return reply
 
-                # Empty response — nudge the model to retry instead
-                # of giving up silently.
+                # Empty response — nudge the model to retry.
+                # Nudge messages are NOT saved to new_messages
+                # so they don't pollute the persistent history.
                 messages.append(
                     {
                         "role": "user",
@@ -473,23 +501,24 @@ FINAL ANSWER RULES
                 continue
 
             # Execute each requested tool and feed results back
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": message.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                }
-            )
+            asst_msg = {
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+            messages.append(asst_msg)
+            if new_messages is not None:
+                new_messages.append(asst_msg)
 
             jobs = []
 
@@ -512,15 +541,12 @@ FINAL ANSWER RULES
 
             tool_names = [tc.function.name for tc in tool_calls]
             print(
-                f"🔧 Tools x{len(jobs)} (parallel): "
+                f"\U0001f527 Tools x{len(jobs)} (parallel): "
                 + " | ".join(
                     f"{name}({q})" for name, (_, q) in zip(tool_names, jobs)
                 )
             )
 
-            # Run all tool calls for this round concurrently.
-            # Results are stashed and appended in the ORIGINAL tool-call
-            # order so tool messages always line up with tool_calls.
             ordered_results = [None] * len(jobs)
 
             with ThreadPoolExecutor(
@@ -548,33 +574,42 @@ FINAL ANSWER RULES
 
                     except Exception as e:
 
-                        print(f"⚠️ Tool failed: {e}")
+                        print(f"\u26a0\ufe0f Tool failed: {e}")
 
                         ordered_results[index] = []
 
             for index, (tc, query) in enumerate(jobs):
                 raw = ordered_results[index] or []
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": (
-                            self._format_tool_result(
-                                tc.function.name,
-                                raw,
-                            )
-                        ),
-                    }
-                )
+                tool_msg = {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": (
+                        self._format_tool_result(
+                            tc.function.name,
+                            raw,
+                        )
+                    ),
+                }
+                messages.append(tool_msg)
+                if new_messages is not None:
+                    new_messages.append(tool_msg)
 
         # Round limit reached without a final answer
         return ""
 
-    def _run_agent_loop_streaming(self, system_prompt, user_text, prior_turns, cancel_event=None, rag_context=None):
+    def _run_agent_loop_streaming(
+        self, system_prompt, user_text, prior_turns,
+        cancel_event=None, rag_context=None,
+        new_messages=None,
+    ):
         """
         Run the tool-calling loop with streaming on the FINAL answer.
         Tool-call rounds are non-streaming. Returns an iterator of
         text chunks for the final answer.
+
+        If new_messages is provided (a list), all new messages
+        generated during this turn are appended to it for KV cache
+        preservation.
         """
 
         messages = [
@@ -583,12 +618,10 @@ FINAL ANSWER RULES
 
         messages.extend(prior_turns)
 
-        messages.append(
-            {
-                "role": "user",
-                "content": user_text,
-            }
-        )
+        user_msg = {"role": "user", "content": user_text}
+        messages.append(user_msg)
+        if new_messages is not None:
+            new_messages.append(user_msg)
 
         for _ in range(MAX_SEARCH_ROUNDS):
 
@@ -676,13 +709,14 @@ FINAL ANSWER RULES
                         },
                     })
 
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": assistant_content,
-                        "tool_calls": assistant_tool_calls,
-                    }
-                )
+                asst_msg = {
+                    "role": "assistant",
+                    "content": assistant_content,
+                    "tool_calls": assistant_tool_calls,
+                }
+                messages.append(asst_msg)
+                if new_messages is not None:
+                    new_messages.append(asst_msg)
 
                 # Execute tools in parallel
                 jobs = []
@@ -701,7 +735,7 @@ FINAL ANSWER RULES
 
                 tool_names = [tc["function"]["name"] for tc in assistant_tool_calls]
                 print(
-                    f"🔧 Tools x{len(jobs)} (parallel): "
+                    f"\U0001f527 Tools x{len(jobs)} (parallel): "
                     + " | ".join(
                         f"{name}({q})" for name, (_, q) in zip(tool_names, jobs)
                     )
@@ -730,44 +764,49 @@ FINAL ANSWER RULES
                         try:
                             ordered_results[index] = future.result()
                         except Exception as e:
-                            print(f"⚠️ Tool failed: {e}")
+                            print(f"\u26a0\ufe0f Tool failed: {e}")
                             ordered_results[index] = []
 
                 for index, (tc_raw, query) in enumerate(jobs):
                     raw = ordered_results[index] or []
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc_raw["id"],
-                            "content": (
-                                self._format_tool_result(
-                                    tc_raw["function"]["name"],
-                                    raw,
-                                )
-                            ),
-                        }
-                    )
+                    tool_msg = {
+                        "role": "tool",
+                        "tool_call_id": tc_raw["id"],
+                        "content": (
+                            self._format_tool_result(
+                                tc_raw["function"]["name"],
+                                raw,
+                            )
+                        ),
+                    }
+                    messages.append(tool_msg)
+                    if new_messages is not None:
+                        new_messages.append(tool_msg)
 
                 continue
 
-            # No tool calls — this is the final answer, stream it
+            # No tool calls — this is the final answer
             reply = "".join(content_parts).strip()
 
             # Handle reasoning models (Gemma4, DeepSeek, etc.)
             if not reply and reasoning_parts:
                 raw_reasoning = "".join(reasoning_parts).strip()
-                lines = [line.strip() for line in raw_reasoning.split("\n") if line.strip()]
-                ans_lines = [l for l in lines if not (l.startswith('*') or l.startswith('Subject:') or l.startswith('Constraint:'))]
+                rlines = [line.strip() for line in raw_reasoning.split("\n") if line.strip()]
+                ans_lines = [l for l in rlines if not (l.startswith('*') or l.startswith('Subject:') or l.startswith('Constraint:'))]
                 if ans_lines:
                     reply = " ".join(ans_lines).strip()
-                elif lines:
-                    reply = lines[-1].strip('* ')
+                elif rlines:
+                    reply = rlines[-1].strip('* ')
 
             if reply:
+                if new_messages is not None:
+                    new_messages.append(
+                        {"role": "assistant", "content": reply}
+                    )
                 yield reply
                 return
 
-            # Empty response — nudge retry
+            # Empty response — nudge retry (NOT saved to new_messages)
             messages.append(
                 {
                     "role": "user",
@@ -792,129 +831,127 @@ FINAL ANSWER RULES
         rag_context=None,
     ):
         """
-        Search the web (as many rounds as the model wants) and return
-        the reply in the user's language.
+        Search the web/docs (tool-calling loop) and return reply in user's language.
 
-        chat_history is mutated in place (user + assistant turns
-        are appended) so multi-turn context is preserved.
+        KV CACHE PRESERVATION:
+        chat_history is mutated in place — all new messages from this turn
+        (user, tool calls, tool results, assistant) are appended in exact order
+        so that subsequent turns preserve the EXACT token prefix sequence.
+        This ensures llama.cpp reuses cached KV states across conversation turns.
 
-        If cancel_event (a threading.Event) is set while searching,
-        the loop stops early and returns "" (nothing is added to
-        chat_history).
-
-        If stream=True, returns a generator that yields chunks of the
-        final answer (after all tool-call rounds).
+        If stream=True: returns a generator that yields text chunks.
+        If stream=False: returns the complete reply string.
         """
+        if stream:
+            return self._generate_response_stream(
+                user_text=user_text,
+                chat_history=chat_history,
+                cancel_event=cancel_event,
+                rag_context=rag_context,
+            )
+        else:
+            return self._generate_response_sync(
+                user_text=user_text,
+                chat_history=chat_history,
+                cancel_event=cancel_event,
+                rag_context=rag_context,
+            )
 
+    def _generate_response_sync(
+        self,
+        user_text,
+        chat_history,
+        cancel_event=None,
+        rag_context=None,
+    ):
+        """Synchronous non-streaming implementation that returns a string."""
         if self.client is None:
-
-            msg = (
+            return (
                 "Sorry, the assistant is not configured. "
                 "Please set the OPENCODE_API_KEY."
             )
 
-            if stream:
-                yield msg
-                return
-            else:
-                return msg
-
-        # ----------------------------------------
-        # 1. Use the pre-built system prompt
-        # ----------------------------------------
-
         system_prompt = self.system_prompt
-
-        # ----------------------------------------
-        # 2. Prior turns (everything except index 0)
-        # ----------------------------------------
+        if chat_history and chat_history[0].get("role") == "system":
+            chat_history[0]["content"] = system_prompt
 
         prior_turns = chat_history[1:] if chat_history else []
+        new_messages = []
 
-        # ----------------------------------------
-        # 3. Run the search-agent loop
-        # ----------------------------------------
-
-        if stream:
-            # Streaming mode: yield chunks from the final answer
-            full_reply = ""
-
-            for chunk in self._run_agent_loop_streaming(
+        try:
+            reply = self._run_agent_loop(
                 system_prompt=system_prompt,
                 user_text=user_text,
                 prior_turns=prior_turns,
                 cancel_event=cancel_event,
                 rag_context=rag_context,
-            ):
-                full_reply += chunk
-                yield chunk
-
-            # Interrupted mid-search: discard
-            if (
-                cancel_event
-                and cancel_event.is_set()
-            ):
-                return
-
-            if not full_reply:
-                full_reply = (
-                    "I couldn't find an answer "
-                    "for that right now. Please try again."
-                )
-                yield full_reply
-
-            # Remember turns
-            chat_history.append(
-                {"role": "user", "content": user_text}
+                new_messages=new_messages,
             )
-            chat_history.append(
-                {"role": "assistant", "content": full_reply}
+        except Exception as e:
+            print(f"⚠️ LLM request failed: {e}")
+            return "Sorry, I couldn't reach the assistant service right now."
+
+        if cancel_event and cancel_event.is_set():
+            return ""
+
+        if not reply:
+            reply = (
+                "I couldn't find an answer for that right now. "
+                "Please try again."
             )
+            new_messages.append({"role": "assistant", "content": reply})
 
-        else:
-            # Non-streaming mode
-            try:
+        chat_history.extend(new_messages)
+        self._trim_history(chat_history)
+        return reply
 
-                reply = self._run_agent_loop(
-                    system_prompt=system_prompt,
-                    user_text=user_text,
-                    prior_turns=prior_turns,
-                    cancel_event=cancel_event,
-                    rag_context=rag_context,
-                )
-
-            except Exception as e:
-
-                print(f"⚠️ LLM request failed: {e}")
-
-                return (
-                    "Sorry, I couldn't reach "
-                    "the assistant service right now."
-                )
-
-            # Interrupted mid-search: discard
-            if (
-                cancel_event
-                and cancel_event.is_set()
-            ):
-                return ""
-
-            if not reply:
-
-                reply = (
-                    "I couldn't find an answer "
-                    "for that right now. Please try again."
-                )
-
-            # Remember turns
-            chat_history.append(
-                {"role": "user", "content": user_text}
+    def _generate_response_stream(
+        self,
+        user_text,
+        chat_history,
+        cancel_event=None,
+        rag_context=None,
+    ):
+        """Streaming generator implementation that yields text chunks."""
+        if self.client is None:
+            yield (
+                "Sorry, the assistant is not configured. "
+                "Please set the OPENCODE_API_KEY."
             )
-            chat_history.append(
-                {"role": "assistant", "content": reply}
-            )
+            return
 
-            return reply
+        system_prompt = self.system_prompt
+        if chat_history and chat_history[0].get("role") == "system":
+            chat_history[0]["content"] = system_prompt
+
+        prior_turns = chat_history[1:] if chat_history else []
+        new_messages = []
+        full_reply = ""
+
+        for chunk in self._run_agent_loop_streaming(
+            system_prompt=system_prompt,
+            user_text=user_text,
+            prior_turns=prior_turns,
+            cancel_event=cancel_event,
+            rag_context=rag_context,
+            new_messages=new_messages,
+        ):
+            full_reply += chunk
+            yield chunk
+
+        if cancel_event and cancel_event.is_set():
+            return
+
+        if not full_reply:
+            full_reply = (
+                "I couldn't find an answer for that right now. "
+                "Please try again."
+            )
+            yield full_reply
+            new_messages.append({"role": "assistant", "content": full_reply})
+
+        chat_history.extend(new_messages)
+        self._trim_history(chat_history)
 
 
 # Shared instance used by the main chatbot loop
