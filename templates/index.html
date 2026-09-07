@@ -486,7 +486,39 @@
         return 'sess_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
     }
 
-    let sessionId = generateSessionId();
+    function persistSessionId() {
+        try {
+            sessionStorage.setItem('chatbot_session_id', sessionId);
+        } catch (e) {}
+    }
+
+    // Reuse the tab's session across reloads / Back-button
+    // navigation so the conversation survives. A fresh tab
+    // starts a fresh conversation.
+    let sessionId = null;
+    try {
+        sessionId = sessionStorage.getItem('chatbot_session_id');
+    } catch (e) {}
+    if (!sessionId) {
+        sessionId = generateSessionId();
+        persistSessionId();
+    }
+
+    async function restoreHistory() {
+        try {
+            const res = await fetch(`/api/history?session_id=${encodeURIComponent(sessionId)}`);
+            if (!res.ok) return;
+            const data = await res.json();
+            const msgs = data.history || [];
+            if (!msgs.length) return;
+            hideWelcome();
+            for (const m of msgs) {
+                addMessage(m.content, m.role === 'user' ? 'user' : 'assistant');
+            }
+            scrollToBottom();
+        } catch (e) {}
+    }
+    restoreHistory();
     let ws = null;
     let isVoiceActive = false;
     let isListeningState = false;
@@ -538,6 +570,7 @@
 
             if (data.session_id) {
                 sessionId = data.session_id;
+                persistSessionId();
             }
 
             // Status updates
@@ -796,6 +829,7 @@
 
                         if (data.session_id) {
                             sessionId = data.session_id;
+                            persistSessionId();
                         }
 
                         if (data.text) {
@@ -838,6 +872,7 @@
     // ============================================================
     newChatBtn.addEventListener('click', () => {
         sessionId = generateSessionId();
+        persistSessionId();
         chatContainer.innerHTML = '';
         if (ws) {
             ws.close();

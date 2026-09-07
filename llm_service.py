@@ -21,6 +21,7 @@ between the model and the search engine.
 import json
 import os
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
@@ -34,7 +35,7 @@ load_dotenv()
 
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY")
 OPENCODE_BASE_URL = "https://opencode.ai/zen/v1"
-LLM_MODEL = os.environ.get("OPENCODE_MODEL", "deepseek-v4-flash-free")
+LLM_MODEL = os.environ.get("OPENCODE_MODEL", "nemotron-3.5-lightning-free")
 
 MAX_SEARCH_RESULTS = 5
 MAX_TOKENS = 1200
@@ -305,15 +306,37 @@ class LLMService:
         self.client = None
         self.model = LLM_MODEL
 
+        # True while pointed at OpenCode Zen (set False by
+        # configure_endpoint when re-pointed to local/server).
+        self._is_zen = False
+
+        # Fallback Zen session when the caller has no chat
+        # session id (stable for the process lifetime).
+        self._zen_session = f"ses_{uuid.uuid4().hex[:24]}"
+
         # Build system prompt ONCE
         self.system_prompt = self._build_system_prompt()
 
         if OPENCODE_API_KEY:
 
+            # Identify as the official OpenCode CLI (same headers
+            # the `pi` agent sends). Zen gates free-tier models on
+            # these — without them requests fail with
+            # MissingSessionID ("free tier can only be used in
+            # OpenCode").
+            session_id = self._zen_session
             self.client = OpenAI(
                 api_key=OPENCODE_API_KEY,
                 base_url=OPENCODE_BASE_URL,
+                default_headers={
+                    "x-opencode-client": "pi",
+                    "x-opencode-session": session_id,
+                    "x-opencode-project": "global",
+                    "x-opencode-request": f"msg_{uuid.uuid4().hex[:24]}",
+                    "User-Agent": "opencode/latest/cli",
+                },
             )
+            self._is_zen = True
 
             print(
                 f"LLM Service ready "
@@ -362,6 +385,10 @@ class LLMService:
         if model:
             self.model = model
 
+        # Re-pointed away from Zen (e.g. local llama.cpp) —
+        # Zen session headers no longer apply.
+        self._is_zen = False
+
         print(
             "LLM Service re-pointed to custom endpoint: "
             f"{base_url}"
@@ -401,6 +428,31 @@ class LLMService:
                 f"RAG search failed: {e}. "
                 "Use web_search instead."
             )
+
+    def _zen_headers(self, zen_session=None):
+        """
+        Per-request Zen headers for session affinity (cache hits).
+
+        The session id follows OUR chat session: every turn of the
+        same conversation carries the same x-opencode-session, so
+        Zen routes it to the same provider with warm KV cache.
+        x-opencode-request is fresh on every call.
+        Returns None when not on Zen (local servers ignore it).
+        """
+        if not self._is_zen:
+            return None
+
+        sid = (zen_session or "").strip()
+        if not sid.startswith("ses_"):
+            sid = f"ses_{sid}" if sid else self._zen_session
+
+        return {
+            "x-opencode-client": "pi",
+            "x-opencode-session": sid,
+            "x-opencode-project": "global",
+            "x-opencode-request": f"msg_{uuid.uuid4().hex[:24]}",
+            "User-Agent": "opencode/latest/cli",
+        }
 
     def grievance_tool_call(self, args):
         """
@@ -649,6 +701,7 @@ GRIEVANCE SKILL GUIDE
         self, system_prompt, user_text, prior_turns,
         cancel_event=None, stream=False,
         rag_context=None, new_messages=None,
+        zen_session=None,
     ):
         """
         Run the tool-calling loop until the model answers or the
@@ -688,6 +741,7 @@ GRIEVANCE SKILL GUIDE
                     tool_choice="auto",
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
+                    extra_headers=self._zen_headers(zen_session),
                 )
             )
 
@@ -830,7 +884,7 @@ GRIEVANCE SKILL GUIDE
     def _run_agent_loop_streaming(
         self, system_prompt, user_text, prior_turns,
         cancel_event=None, rag_context=None,
-        new_messages=None,
+        new_messages=None, zen_session=None,
     ):
         """
         Run the tool-calling loop with streaming on the FINAL answer.
@@ -874,6 +928,7 @@ GRIEVANCE SKILL GUIDE
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
                     stream=True,
+                    extra_headers=self._zen_headers(zen_session),
                 )
             )
 
@@ -1061,6 +1116,7 @@ GRIEVANCE SKILL GUIDE
         cancel_event=None,
         stream=False,
         rag_context=None,
+        zen_session=None,
     ):
         """
         Search the web/docs (tool-calling loop) and return reply in user's language.
@@ -1080,6 +1136,7 @@ GRIEVANCE SKILL GUIDE
                 chat_history=chat_history,
                 cancel_event=cancel_event,
                 rag_context=rag_context,
+                zen_session=zen_session,
             )
         else:
             return self._generate_response_sync(
@@ -1087,6 +1144,7 @@ GRIEVANCE SKILL GUIDE
                 chat_history=chat_history,
                 cancel_event=cancel_event,
                 rag_context=rag_context,
+                zen_session=zen_session,
             )
 
     def _generate_response_sync(
@@ -1095,6 +1153,7 @@ GRIEVANCE SKILL GUIDE
         chat_history,
         cancel_event=None,
         rag_context=None,
+        zen_session=None,
     ):
         """Synchronous non-streaming implementation that returns a string."""
         if self.client is None:
@@ -1118,6 +1177,7 @@ GRIEVANCE SKILL GUIDE
                 cancel_event=cancel_event,
                 rag_context=rag_context,
                 new_messages=new_messages,
+                zen_session=zen_session,
             )
         except Exception as e:
             print(f"⚠️ LLM request failed: {e}")
@@ -1143,6 +1203,7 @@ GRIEVANCE SKILL GUIDE
         chat_history,
         cancel_event=None,
         rag_context=None,
+        zen_session=None,
     ):
         """Streaming generator implementation that yields text chunks."""
         if self.client is None:
@@ -1167,6 +1228,7 @@ GRIEVANCE SKILL GUIDE
             cancel_event=cancel_event,
             rag_context=rag_context,
             new_messages=new_messages,
+            zen_session=zen_session,
         ):
             full_reply += chunk
             yield chunk

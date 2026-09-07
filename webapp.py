@@ -67,7 +67,7 @@ ADMIN_PASSWORD = os.environ.get(
 
 WHISPER_SERVER_URL = os.environ.get(
     "WHISPER_SERVER_URL",
-    "http://100.84.186.69:8080/inference",
+    "https://ghost-1.tail1a7c93.ts.net/inference",
 )
 
 # Voice pipeline config
@@ -131,10 +131,15 @@ def get_llm():
     if _llm is None:
         from llm_service import llm_service
 
-        llm_service.configure_endpoint(
-            base_url="http://127.0.0.1:8081/v1",
-            model="local",
-        )
+        backend = os.environ.get("LLM_BACKEND", "local").lower()
+        if backend == "cloud":
+            # Use OpenCode Zen (OPENCODE_API_KEY + OPENCODE_MODEL)
+            print("LLM backend: cloud (OpenCode Zen).")
+        else:
+            llm_service.configure_endpoint(
+                base_url="http://127.0.0.1:8081/v1",
+                model="local",
+            )
         _llm = llm_service
     return _llm
 
@@ -297,6 +302,37 @@ async def audio_processor_js():
 # ============================================================
 
 
+@app.get("/api/history")
+def get_history(session_id: str = ""):
+    """
+    Return the stored user/assistant messages for a session so
+    the chat page can re-render them after reload (e.g. Back
+    from /admin). System/tool entries are excluded, and the
+    per-turn [This request is in ...] language tag is stripped
+    from user messages so the UI shows what the user typed.
+    """
+    if not session_id or session_id not in _chat_sessions:
+        return {"history": []}
+
+    msgs = []
+    for m in _chat_sessions[session_id].get("history", []):
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(content, str):
+            continue
+        if role == "user":
+            content = re.sub(
+                r"^\[This request is in [^\]]+\]\n\n",
+                "",
+                content,
+                count=1,
+            )
+        msgs.append({"role": role, "content": content})
+    return {"history": msgs}
+
+
 @app.post("/api/chat")
 async def chat(request: Request):
     """
@@ -328,6 +364,7 @@ async def chat(request: Request):
                 user_text=user_msg,
                 chat_history=chat_history,
                 stream=True,
+                zen_session=session_id,
             ):
                 loop.call_soon_threadsafe(q.put_nowait, ("chunk", chunk))
             loop.call_soon_threadsafe(q.put_nowait, ("done", None))
@@ -404,7 +441,7 @@ async def voice_input(
         )
 
     llm = get_llm()
-    _, session = _get_or_create_session()
+    voice_sid, session = _get_or_create_session()
     chat_history = session["history"]
 
     # Run LLM in thread to avoid blocking asyncio event loop
@@ -413,6 +450,7 @@ async def voice_input(
         user_text=text,
         chat_history=chat_history,
         stream=False,
+        zen_session=voice_sid,
     )
 
     return JSONResponse({"text": text, "reply": reply})
@@ -755,6 +793,7 @@ async def websocket_voice(ws: WebSocket):
                 user_text=user_msg,
                 chat_history=chat_history,
                 stream=False,
+                zen_session=session_id,
             )
         except Exception as e:
             print(f"⚠️ LLM error: {e}")

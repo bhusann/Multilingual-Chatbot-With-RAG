@@ -430,7 +430,7 @@ def audio_callback(
 
 WHISPER_SERVER_URL = os.environ.get(
     "WHISPER_SERVER_URL",
-    "http://100.84.186.69:8080/inference",
+    "https://ghost-1.tail1a7c93.ts.net/inference",
 )
 
 print(
@@ -503,6 +503,13 @@ llm_service.configure_endpoint(
 if llm_service.client is None:
 
     sys.exit(1)
+
+
+# Stable Zen session id for this terminal run, so all turns
+# share provider-side cache affinity.
+import uuid as _uuid
+
+TERMINAL_ZEN_SESSION = f"ses_terminal_{_uuid.uuid4().hex[:16]}"
 
 
 # ============================================================
@@ -1122,6 +1129,7 @@ def ask_opencode(
         cancel_event=cancel_event,
         stream=stream,
         rag_context=rag_context,
+        zen_session=TERMINAL_ZEN_SESSION,
     )
 
 
