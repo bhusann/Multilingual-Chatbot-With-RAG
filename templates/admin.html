@@ -228,6 +228,89 @@
             z-index: 1000;
         }
 
+        /* Grievance tickets */
+        .section-title {
+            font-size: 18px;
+            color: #f1f5f9;
+            margin: 32px 0 16px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #334155;
+        }
+
+        .ticket-card {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+
+        .ticket-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+
+        .ticket-id {
+            font-weight: 600;
+            color: #f1f5f9;
+            font-family: monospace;
+            font-size: 14px;
+        }
+
+        .ticket-who {
+            font-size: 13px;
+            color: #94a3b8;
+            margin-bottom: 6px;
+        }
+
+        .ticket-desc {
+            font-size: 14px;
+            color: #e2e8f0;
+            margin-bottom: 12px;
+            line-height: 1.5;
+        }
+
+        .ticket-bottom {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .status-SUBMITTED { background: #334155; color: #e2e8f0; }
+        .status-ACKNOWLEDGED { background: #1e3a8a; color: #bfdbfe; }
+        .status-UNDER_REVIEW { background: #713f12; color: #fde68a; }
+        .status-ACTION_REQUIRED { background: #7c2d12; color: #fed7aa; }
+        .status-RESOLVED { background: #14532d; color: #bbf7d0; }
+
+        .status-select {
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            color: #e2e8f0;
+            font-size: 13px;
+            padding: 6px 10px;
+            outline: none;
+            cursor: pointer;
+        }
+
+        .status-select:focus {
+            border-color: #2563eb;
+        }
+
         @keyframes slideUp {
             from { transform: translateY(20px); opacity: 0; }
             to { transform: translateY(0); opacity: 1; }
@@ -271,6 +354,14 @@
             <div class="documents-list" id="documentsList">
                 <div class="empty-state" id="emptyState">
                     <p>No documents uploaded yet.</p>
+                </div>
+            </div>
+
+            <!-- Grievance tickets -->
+            <h2 class="section-title">🎫 Grievance Tickets</h2>
+            <div class="documents-list" id="ticketsList">
+                <div class="empty-state">
+                    <p>No grievance tickets yet.</p>
                 </div>
             </div>
         </div>
@@ -330,6 +421,7 @@
             loginScreen.style.display = 'none';
             adminPanel.style.display = 'block';
             loadDocuments();
+            loadGrievances();
         }
 
         // ========== DOCUMENTS ==========
@@ -480,6 +572,92 @@
                     <p><strong>Drop PDF or TXT file here</strong></p>
                     <p>or click to browse</p>
                 `;
+            }
+        }
+
+        // ========== GRIEVANCES ==========
+        const ticketsList = document.getElementById('ticketsList');
+        const STATUSES = ['SUBMITTED', 'ACKNOWLEDGED', 'UNDER_REVIEW', 'ACTION_REQUIRED', 'RESOLVED'];
+
+        async function loadGrievances() {
+            try {
+                const res = await fetch('/admin/api/grievances', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`,
+                    },
+                    credentials: 'include',
+                });
+
+                if (!res.ok) return;
+
+                const data = await res.json();
+                renderGrievances(data.tickets);
+
+            } catch (e) {
+                console.error('Failed to load grievances:', e);
+            }
+        }
+
+        function renderGrievances(tickets) {
+            ticketsList.innerHTML = '';
+
+            if (!tickets || tickets.length === 0) {
+                ticketsList.innerHTML = '<div class="empty-state"><p>No grievance tickets yet.</p></div>';
+                return;
+            }
+
+            tickets.forEach(t => {
+                const card = document.createElement('div');
+                card.className = 'ticket-card';
+
+                const options = STATUSES.map(s =>
+                    `<option value="${s}"${s === t.status ? ' selected' : ''}>${s.replace(/_/g, ' ')}</option>`
+                ).join('');
+
+                card.innerHTML = `
+                    <div class="ticket-top">
+                        <span class="ticket-id">${escapeHtml(t.ticket_id)}</span>
+                        <span class="status-badge status-${escapeHtml(t.status)}">${escapeHtml(t.status.replace(/_/g, ' '))}</span>
+                    </div>
+                    <div class="ticket-who">
+                        ${escapeHtml(t.user_name)} • ${escapeHtml(t.mobile)} • ${escapeHtml(t.district)}, ${escapeHtml(t.state)}
+                        • ${escapeHtml(t.category)}
+                        ${t.created_at ? ' • ' + new Date(t.created_at).toLocaleDateString() : ''}
+                    </div>
+                    <div class="ticket-desc">${escapeHtml(t.description)}</div>
+                    <div class="ticket-bottom">
+                        <label style="font-size: 12px; color: #64748b;">Update status:</label>
+                        <select class="status-select" onchange="updateGrievanceStatus('${escapeHtml(t.ticket_id)}', this.value)">
+                            ${options}
+                        </select>
+                    </div>
+                `;
+                ticketsList.appendChild(card);
+            });
+        }
+
+        async function updateGrievanceStatus(ticketId, status) {
+            try {
+                const res = await fetch(`/admin/api/grievances/${ticketId}`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`,
+                    },
+                    credentials: 'include',
+                    body: JSON.stringify({ status }),
+                });
+
+                if (res.ok) {
+                    showToast(`${ticketId} → ${status.replace(/_/g, ' ')}`);
+                    loadGrievances();
+                } else {
+                    showToast('Status update failed');
+                }
+            } catch (e) {
+                showToast('Connection error');
             }
         }
 

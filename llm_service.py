@@ -188,6 +188,94 @@ RAG_SEARCH_TOOL = {
     },
 }
 
+GRIEVANCE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "grievance_tool",
+        "description": (
+            "File a grievance complaint or check complaint status. "
+            "Action 'create_ticket': register a complaint. You MUST "
+            "have collected user_name, mobile, state, district and "
+            "description from the user first (see the GRIEVANCE SKILL "
+            "GUIDE in your instructions), and infer 'category' "
+            "yourself from the complaint context. "
+            "Action 'check_status': look up tickets using ticket_id "
+            "or the mobile number given at filing time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create_ticket", "check_status"],
+                    "description": (
+                        "create_ticket to register a new complaint, "
+                        "check_status to look up existing tickets."
+                    ),
+                },
+                "user_name": {
+                    "type": "string",
+                    "description": "Complainant's full name (create only).",
+                },
+                "mobile": {
+                    "type": "string",
+                    "description": (
+                        "10-digit mobile number. Required for create; "
+                        "also accepted as lookup key for check_status."
+                    ),
+                },
+                "state": {
+                    "type": "string",
+                    "description": "State name (create only).",
+                },
+                "district": {
+                    "type": "string",
+                    "description": "District name (create only).",
+                },
+                "category": {
+                    "type": "string",
+                    "description": (
+                        "Inferred from complaint context (create only): "
+                        "PACS, PMFBY, LOAN, SUBSIDY or OTHER."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "What happened, in the user's own words "
+                        "(create only)."
+                    ),
+                },
+                "ticket_id": {
+                    "type": "string",
+                    "description": (
+                        "Ticket id like GRV-20260907-A3F9 "
+                        "(check_status only, if known)."
+                    ),
+                },
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
+def load_grievance_skill():
+    """
+    Load the grievance skill guide for the system prompt.
+    Best-effort: returns empty string if the file is missing.
+    """
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "skills",
+        "grievance_tool_usage_guide.txt",
+    )
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
 
 # ============================================================
 # LLM SERVICE
@@ -314,12 +402,138 @@ class LLMService:
                 "Use web_search instead."
             )
 
-    def _dispatch_tool(self, tool_name, query, user_text):
+    def grievance_tool_call(self, args):
+        """
+        Handle grievance_tool actions.
+
+        create_ticket: one-shot registration. All fields must be
+        present — if anything is missing, return what is missing
+        so the LLM asks the user instead of filing a bad ticket.
+        check_status: look up by ticket_id or mobile number.
+
+        Returns a formatted string for the LLM.
+        """
+        from grievance_store import get_grievance_store
+
+        action = (args.get("action") or "").strip()
+        store = get_grievance_store()
+
+        if action == "create_ticket":
+            required = [
+                "user_name", "mobile", "state",
+                "district", "description",
+            ]
+            missing = [
+                f for f in required
+                if not (args.get(f) or "").strip()
+            ]
+            if missing:
+                print(
+                    "🎫 Grievance tool: create_ticket "
+                    f"missing {missing}"
+                )
+                return (
+                    "Cannot create the ticket yet — missing: "
+                    + ", ".join(missing)
+                    + ". Ask the user for these and call "
+                    "create_ticket again with all fields."
+                )
+
+            digits = "".join(
+                c for c in args["mobile"] if c.isdigit()
+            )
+            if len(digits) != 10:
+                return (
+                    "The mobile number must contain exactly "
+                    "10 digits. Ask the user to confirm it and "
+                    "call create_ticket again."
+                )
+
+            try:
+                t = store.create_ticket(
+                    user_name=args["user_name"],
+                    mobile=args["mobile"],
+                    state=args["state"],
+                    district=args["district"],
+                    category=args.get("category", "OTHER"),
+                    description=args["description"],
+                )
+            except Exception as e:
+                print(f"⚠️ Ticket creation failed: {e}")
+                return f"Ticket creation failed: {e}."
+
+            print(
+                f"🎫 Grievance tool: created {t['ticket_id']}"
+            )
+            return (
+                "Ticket registered successfully:\n"
+                f"Ticket ID: {t['ticket_id']}\n"
+                f"Name: {t['user_name']}\n"
+                f"Category: {t['category']}\n"
+                f"Status: {t['status']}\n"
+                "Read the ticket ID back to the user and tell "
+                "them to keep it safe for status checks."
+            )
+
+        elif action == "check_status":
+            ticket_id = (args.get("ticket_id") or "").strip()
+            mobile = (args.get("mobile") or "").strip()
+
+            tickets = []
+            if ticket_id:
+                t = store.get_ticket(ticket_id)
+                if t:
+                    tickets = [t]
+            elif mobile:
+                tickets = store.find_by_mobile(mobile)
+            else:
+                return (
+                    "Need a ticket_id or mobile number to check "
+                    "status. Ask the user for one of them and call "
+                    "check_status again."
+                )
+
+            n = len(tickets)
+            print(
+                f"🎫 Grievance tool: check_status "
+                f"found {n} ticket(s)"
+            )
+            if not tickets:
+                return (
+                    "No tickets found for that lookup. Tell the "
+                    "user no complaint is registered under it and "
+                    "offer to file a new complaint."
+                )
+
+            lines = []
+            for i, t in enumerate(tickets, start=1):
+                lines.append(
+                    f"{i}. Ticket {t['ticket_id']} "
+                    f"({t['category']}, filed {t['created_at'][:10]}): "
+                    f"status {t['status']} — "
+                    f"{t['description'][:120]}"
+                )
+            return (
+                f"Found {n} ticket(s):\n"
+                + "\n".join(lines)
+                + "\nReport each ticket's status in plain words "
+                "in the user's language."
+            )
+
+        else:
+            return (
+                f"Unknown grievance action '{action}'. "
+                "Use 'create_ticket' or 'check_status'."
+            )
+
+    def _dispatch_tool(self, tool_name, query, user_text, args=None):
         """Dispatch a single tool call to the right handler."""
         if tool_name == "web_search":
             return self.search_engine.search(query)
         elif tool_name == "rag_search":
             return self.rag_search(query)
+        elif tool_name == "grievance_tool":
+            return self.grievance_tool_call(args or {})
         else:
             print(f"⚠️ Unknown tool: {tool_name}")
             return []
@@ -332,6 +546,9 @@ class LLMService:
             )
         elif tool_name == "rag_search":
             # rag_search already returns formatted string
+            return raw_result
+        elif tool_name == "grievance_tool":
+            # grievance_tool already returns formatted string
             return raw_result
         else:
             return str(raw_result)
@@ -346,7 +563,8 @@ TODAY'S DATE: {self.today_date}
 SEARCH AGENT BEHAVIOUR
 ======================
 
-You are a research agent with TWO tools: `web_search` and `rag_search`.
+You are a research agent with THREE tools: `web_search`, `rag_search`
+and `grievance_tool`.
 
 TOOLS
 -----
@@ -356,6 +574,12 @@ TOOLS
   Query MUST be in ENGLISH keywords (the embedding model handles
   multilingual matching). Use this for specific scheme details,
   eligibility, amounts, application steps from uploaded docs.
+- `grievance_tool(action, ...)` — File a grievance complaint
+  (`action="create_ticket"`) or check complaint status
+  (`action="check_status"`). When the user wants to complain, FIRST
+  read the GRIEVANCE SKILL GUIDE below and collect every required
+  field before calling. When the user asks about their complaint,
+  ask for their ticket_id or mobile number, then call check_status.
 
 PARALLEL TOOL CALLS
 -------------------
@@ -393,6 +617,10 @@ FINAL ANSWER RULES
 - When citing amounts, dates or eligibility rules, use the LATEST
   figures from the search results. If a year is involved, state it
   clearly.
+
+GRIEVANCE SKILL GUIDE
+=====================
+{load_grievance_skill()}
 """
 
     def _trim_history(self, chat_history):
@@ -456,7 +684,7 @@ FINAL ANSWER RULES
                 .create(
                     model=self.model,
                     messages=messages,
-                    tools=[WEB_SEARCH_TOOL, RAG_SEARCH_TOOL],
+                    tools=[WEB_SEARCH_TOOL, RAG_SEARCH_TOOL, GRIEVANCE_TOOL],
                     tool_choice="auto",
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
@@ -535,15 +763,16 @@ FINAL ANSWER RULES
 
                 except Exception:
 
+                    args = {}
                     query = user_text
 
-                jobs.append((tc, query))
+                jobs.append((tc, query, args))
 
             tool_names = [tc.function.name for tc in tool_calls]
             print(
                 f"\U0001f527 Tools x{len(jobs)} (parallel): "
                 + " | ".join(
-                    f"{name}({q})" for name, (_, q) in zip(tool_names, jobs)
+                    f"{name}({q})" for name, (_, q, _) in zip(tool_names, jobs)
                 )
             )
 
@@ -558,12 +787,13 @@ FINAL ANSWER RULES
 
                 future_by_index = {}
 
-                for index, (tc, query) in enumerate(jobs):
+                for index, (tc, query, args) in enumerate(jobs):
                     future_by_index[index] = pool.submit(
                         self._dispatch_tool,
                         tc.function.name,
                         query,
                         user_text,
+                        args,
                     )
 
                 for index, future in future_by_index.items():
@@ -578,7 +808,7 @@ FINAL ANSWER RULES
 
                         ordered_results[index] = []
 
-            for index, (tc, query) in enumerate(jobs):
+            for index, (tc, query, args) in enumerate(jobs):
                 raw = ordered_results[index] or []
                 tool_msg = {
                     "role": "tool",
@@ -639,7 +869,7 @@ FINAL ANSWER RULES
                 .create(
                     model=self.model,
                     messages=messages,
-                    tools=[WEB_SEARCH_TOOL, RAG_SEARCH_TOOL],
+                    tools=[WEB_SEARCH_TOOL, RAG_SEARCH_TOOL, GRIEVANCE_TOOL],
                     tool_choice="auto",
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
@@ -729,15 +959,16 @@ FINAL ANSWER RULES
                         )
                         query = args.get("query", user_text)
                     except Exception:
+                        args = {}
                         query = user_text
 
-                    jobs.append((tc_raw, query))
+                    jobs.append((tc_raw, query, args))
 
                 tool_names = [tc["function"]["name"] for tc in assistant_tool_calls]
                 print(
                     f"\U0001f527 Tools x{len(jobs)} (parallel): "
                     + " | ".join(
-                        f"{name}({q})" for name, (_, q) in zip(tool_names, jobs)
+                        f"{name}({q})" for name, (_, q, _) in zip(tool_names, jobs)
                     )
                 )
 
@@ -752,12 +983,13 @@ FINAL ANSWER RULES
 
                     future_by_index = {}
 
-                    for index, (tc_raw, query) in enumerate(jobs):
+                    for index, (tc_raw, query, args) in enumerate(jobs):
                         future_by_index[index] = pool.submit(
                             self._dispatch_tool,
                             tc_raw["function"]["name"],
                             query,
                             user_text,
+                            args,
                         )
 
                     for index, future in future_by_index.items():
@@ -767,7 +999,7 @@ FINAL ANSWER RULES
                             print(f"\u26a0\ufe0f Tool failed: {e}")
                             ordered_results[index] = []
 
-                for index, (tc_raw, query) in enumerate(jobs):
+                for index, (tc_raw, query, args) in enumerate(jobs):
                     raw = ordered_results[index] or []
                     tool_msg = {
                         "role": "tool",

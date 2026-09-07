@@ -67,7 +67,7 @@ ADMIN_PASSWORD = os.environ.get(
 
 WHISPER_SERVER_URL = os.environ.get(
     "WHISPER_SERVER_URL",
-    "http://127.0.0.1:8080/inference",
+    "http://100.84.186.69:8080/inference",
 )
 
 # Voice pipeline config
@@ -1041,6 +1041,50 @@ async def delete_document(
     store = get_store()
     store.delete_document(doc_id)
     return JSONResponse({"status": "deleted", "doc_id": doc_id})
+
+
+# ============================================================
+# ADMIN: GRIEVANCE TICKETS
+# ============================================================
+
+
+@app.post("/admin/api/grievances")
+async def list_grievances(
+    request: Request,
+    _=Depends(verify_admin),
+):
+    """List all grievance tickets, newest first."""
+    from grievance_store import get_grievance_store
+
+    store = get_grievance_store()
+    tickets = store.list_tickets()
+    return JSONResponse({"tickets": tickets})
+
+
+@app.patch("/admin/api/grievances/{ticket_id}")
+async def update_grievance_status(
+    ticket_id: str,
+    request: Request,
+    _=Depends(verify_admin),
+):
+    """Update a ticket's status (staff only)."""
+    from grievance_store import get_grievance_store
+
+    body = await request.json()
+    status = body.get("status", "")
+
+    store = get_grievance_store()
+    try:
+        ticket = store.update_status(ticket_id, status)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if ticket is None:
+        raise HTTPException(
+            status_code=404, detail="Ticket not found"
+        )
+
+    return JSONResponse({"status": "updated", "ticket": ticket})
 
 
 # ============================================================

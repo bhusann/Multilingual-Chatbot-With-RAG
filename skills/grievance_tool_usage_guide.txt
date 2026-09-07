@@ -1,0 +1,63 @@
+GRIEVANCE TOOL — USAGE GUIDE (read before calling grievance_tool)
+=================================================================
+You help users FILE a complaint and CHECK its progress. The tool has
+two actions: create_ticket and check_status. Call it ONE-SHOT — only
+when you already hold every required field. Never call with blanks,
+never invent details.
+
+ACTION 1: create_ticket — register a new grievance
+--------------------------------------------------
+Collect ALL of these from the user, in their own language, one or two
+questions at a time (conversational, not a form interrogation):
+  1. user_name    - full name of the complainant
+  2. mobile       - 10-digit mobile number (digits only)
+  3. state        - state name (e.g. Tamil Nadu)
+  4. district     - district name (e.g. Thanjavur)
+  5. description  - what happened, in the user's own words (their
+                   language is fine — pass it through as-is)
+
+Decide the CATEGORY yourself from the complaint context. Pick the
+closest match:
+  - PACS      : PACS / cooperative society issues — membership,
+                loans from society, share capital, society staff,
+                PACS services, meeting/election complaints
+  - PMFBY     : crop insurance — enrolment, premium deducted but no
+                policy, claim filed but not paid, claim delay/reject
+  - LOAN      : farm or KCC loan issues outside PACS (bank loan delay,
+                interest subvention not received)
+  - SUBSIDY   : scheme subsidy/benefit not received (seed, fertilizer,
+                machinery, PM-KISAN instalment)
+  - OTHER     : anything that fits none of the above
+
+Rules:
+- Ask for missing fields BEFORE calling. If the user gave everything
+  in one message, call immediately — do not re-ask.
+- Validate mobile loosely: must contain 10 digits. If invalid, ask
+  once more; do not call the tool with it.
+- After the tool returns, ALWAYS read the ticket_id back to the user
+  and tell them to keep it safe for status checks.
+
+ACTION 2: check_status — user asks about their complaint
+--------------------------------------------------------
+Trigger phrases (any language): "my complaint status", "what happened
+to my complaint", "ticket lenthenna aachu", "meri shikayat ka kya hua",
+etc. To look up, you need ONE identifier:
+  - ticket_id (e.g. GRV-20260907-A3F9), OR
+  - mobile number used while filing
+If you have neither, ask for one of them — then call check_status.
+Report EVERY ticket found: ticket_id, category, current status in
+plain words, and what it means:
+  - SUBMITTED      : received, waiting for officer pickup
+  - ACKNOWLEDGED   : officer has seen it
+  - UNDER_REVIEW   : being examined, may need documents from user
+  - ACTION_REQUIRED: officer asked the user to act (submit proof,
+                     visit office, correct details) — tell the user
+                     to follow up
+  - RESOLVED       : closed as solved
+
+GENERAL
+-------
+- Respond in the user's language (same language rules as always).
+- Status moves forward SUBMITTED -> ACKNOWLEDGED -> UNDER_REVIEW ->
+  ACTION_REQUIRED -> RESOLVED. Only staff change it; you only report.
+- If no ticket is found, say so and offer to file a new complaint.
