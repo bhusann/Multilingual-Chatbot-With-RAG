@@ -17,6 +17,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -30,6 +31,29 @@ from rag.vector_store import (
     VectorStore,
     compute_file_hash,
 )
+
+
+# Print boilerplate that pollutes chunks (headers/footers from
+# browser/PDF printouts). Stripped BEFORE chunking so it never
+# becomes a heading or dilutes embeddings.
+_BOILERPLATE_RES = (
+    re.compile(r"https?://\S+"),                       # print URLs
+    re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}[,\s]+\d{1,2}:\d{2}\b"),  # print timestamps
+)
+
+
+def clean_extracted_text(text):
+    """
+    Remove print boilerplate (URLs, print timestamps) from
+    extracted text. Collapses leftover blank lines.
+    """
+    for rx in _BOILERPLATE_RES:
+        text = rx.sub("", text)
+
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", text)
+
+    return text.strip()
 
 
 def extract_text_from_pdf(filepath):
@@ -51,12 +75,15 @@ def extract_text_from_pdf(filepath):
 
         if text and text.strip():
 
-            pages.append(
-                {
-                    "text": text.strip(),
-                    "page": page_num + 1,
-                }
-            )
+            text = clean_extracted_text(text)
+
+            if text:
+                pages.append(
+                    {
+                        "text": text,
+                        "page": page_num + 1,
+                    }
+                )
 
     doc.close()
 
@@ -77,7 +104,9 @@ def extract_text_from_txt(filepath):
             with open(filepath, "r", encoding=encoding) as f:
                 text = f.read()
             if text.strip():
-                return [{"text": text.strip(), "page": 0}]
+                text = clean_extracted_text(text)
+                if text:
+                    return [{"text": text, "page": 0}]
         except (UnicodeDecodeError, ValueError):
             continue
 

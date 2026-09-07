@@ -93,45 +93,75 @@ def _split_into_sections(text):
     """
     Split text into sections based on common heading patterns.
 
+    Rules (deliberately strict — a false heading splits a chunk
+    and pollutes retrieval, while a missed heading only merges):
+
+    - Numbered ("1. ..."), roman ("IV. ...") and markdown
+      ("# ...") headings: must fit on ONE line, <= 120 chars,
+      and must not contain URLs or print timestamps.
+    - ALLCAPS headings ("ELIGIBILITY CRITERIA:"): the whole
+      line must be uppercase-ish and <= 80 chars, AND it must
+      either end with a colon or be followed by a blank line.
+      This rejects form-field labels ("PAN Card Number : X",
+      "PERMANENT ADDRESS (TAMIL NADU)" followed by an address).
+
     Returns list of (heading, body_text) tuples.
     """
 
-    # Common heading patterns in government documents
+    numbered = r"(?:\d+[\.\)]\s+.+)"
+    roman = r"(?:[IVX]+[\.\)]\s+.+)"
+    markdown = r"(?:#+\s+.+)"
+    allcaps = r"(?:[A-Z][A-Z \t/\-&()',]{1,77}:?)"
+
     heading_pattern = re.compile(
-        r"^"
-        r"(?:"
-        r"(?:\d+[\.\)]\s+)"           # "1. " or "1) "
-        r"|(?:[IVX]+[\.\)]\s+)"       # "IV. " or "IV) "
-        r"|(?:#+\s+)"                  # "# " markdown
-        r"|(?:[A-Z][A-Z\s]{2,}:?\s)"  # "SECTION NAME: " or "SECTION NAME "
-        r")"
-        r"(.+)$",
+        r"^(?P<heading>" + "|".join(
+            [numbered, roman, markdown, allcaps]
+        ) + r")$",
         re.MULTILINE,
     )
 
-    matches = list(heading_pattern.finditer(text))
+    candidates = []
 
-    if not matches:
+    for match in heading_pattern.finditer(text):
+        heading = match.group("heading").strip()
+
+        if len(heading) > 120:
+            continue
+
+        # Boilerplate is never a heading
+        if _is_boilerplate(heading):
+            continue
+
+        # ALLCAPS branch only: demand colon or blank line after
+        if re.fullmatch(allcaps, heading):
+            after = text[match.end():]
+            follows_blank_line = after.startswith(
+                ("\n\n", "\r\n\r\n")
+            ) or re.match(r"[ \t]*\r?\n[ \t]*\r?\n", after)
+            if not heading.endswith(":") and not follows_blank_line:
+                continue
+
+        candidates.append((match, heading))
+
+    if not candidates:
         # No headings found — return entire text
         return [("", text)]
 
     sections = []
 
     # Content before first heading
-    if matches[0].start() > 0:
-        pre_text = text[: matches[0].start()].strip()
+    if candidates[0][0].start() > 0:
+        pre_text = text[: candidates[0][0].start()].strip()
         if pre_text:
             sections.append(("", pre_text))
 
-    for i, match in enumerate(matches):
-
-        heading = match.group(0).strip()
+    for i, (match, heading) in enumerate(candidates):
 
         # End of this section is start of next heading (or EOF)
         start = match.end()
         end = (
-            matches[i + 1].start()
-            if i + 1 < len(matches)
+            candidates[i + 1][0].start()
+            if i + 1 < len(candidates)
             else len(text)
         )
 
@@ -141,6 +171,19 @@ def _split_into_sections(text):
             sections.append((heading, body))
 
     return sections
+
+
+# Fragments that come from print headers/footers, never headings
+_BOILERPLATE_RES = (
+    re.compile(r"https?://\S+"),
+    re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}[,\s]+\d{1,2}:\d{2}"),
+    re.compile(r"\bregistration_print\.php\b", re.IGNORECASE),
+)
+
+
+def _is_boilerplate(line):
+    """True if the line is print boilerplate (URL, timestamp)."""
+    return any(rx.search(line) for rx in _BOILERPLATE_RES)
 
 
 def _split_large_text(text, chunk_size, overlap):
