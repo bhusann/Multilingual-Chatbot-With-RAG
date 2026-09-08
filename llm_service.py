@@ -35,7 +35,7 @@ load_dotenv()
 
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY")
 OPENCODE_BASE_URL = "https://opencode.ai/zen/v1"
-LLM_MODEL = os.environ.get("OPENCODE_MODEL", "nemotron-3.5-lightning-free")
+LLM_MODEL = os.environ.get("OPENCODE_MODEL", "big-pickle")
 
 MAX_SEARCH_RESULTS = 5
 MAX_TOKENS = 1200
@@ -327,28 +327,35 @@ class LLMService:
 
         if OPENCODE_API_KEY:
 
-            # Identify as the official OpenCode CLI (same headers
-            # the `pi` agent sends). Zen gates free-tier models on
-            # these — without them requests fail with
-            # MissingSessionID ("free tier can only be used in
-            # OpenCode").
-            session_id = self._zen_session
+            # True only when pointed at OpenCode Zen — Zen
+            # gates free-tier models on the `pi` client
+            # headers (MissingSessionID otherwise). Other
+            # OpenAI-compatible backends (e.g. Groq) must
+            # NOT receive them.
+            is_zen = "opencode.ai" in OPENCODE_BASE_URL
+            extra_headers = {}
+            if is_zen:
+                # Identify as the official OpenCode CLI (same
+                # headers the `pi` agent sends).
+                extra_headers = {
+                    "x-opencode-client": "pi",
+                    "x-opencode-session": self._zen_session,
+                    "x-opencode-project": "global",
+                    "x-opencode-request": (
+                        f"msg_{uuid.uuid4().hex[:24]}"
+                    ),
+                    "User-Agent": "opencode/latest/cli",
+                }
             self.client = OpenAI(
                 api_key=OPENCODE_API_KEY,
                 base_url=OPENCODE_BASE_URL,
-                default_headers={
-                    "x-opencode-client": "pi",
-                    "x-opencode-session": session_id,
-                    "x-opencode-project": "global",
-                    "x-opencode-request": f"msg_{uuid.uuid4().hex[:24]}",
-                    "User-Agent": "opencode/latest/cli",
-                },
+                default_headers=extra_headers,
             )
-            self._is_zen = True
+            self._is_zen = is_zen
 
             print(
                 f"LLM Service ready "
-                f"(OpenCode Zen / {LLM_MODEL})."
+                f"({OPENCODE_BASE_URL} / {LLM_MODEL})."
             )
 
         else:
@@ -375,7 +382,7 @@ class LLMService:
         Re-point this service to a custom OpenAI-compatible
         endpoint (e.g. a local llama.cpp server).
 
-        The default OpenCode Zen server stays untouched for
+        The default cloud server stays untouched for
         any other scripts that share this module.
         """
 

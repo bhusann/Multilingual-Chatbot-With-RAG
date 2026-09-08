@@ -525,6 +525,9 @@
     // True while server streams/plays TTS: mic frames keep
     // flowing so the server can hear the "alexa" barge-in.
     let isPlayingTts = false;
+    // True once the mic pipeline runs. Stays on across voice
+    // sessions so "alexa" can auto-start voice mode anytime.
+    let micArmed = false;
     let audioCtx = null;
     let micStream = null;
     let workletNode = null;
@@ -547,6 +550,15 @@
         ws.onopen = () => {
             console.log('Voice socket connected');
             setStatus('ready');
+            // Arm the mic right away so "alexa" works without
+            // ever touching the mic button. Quiet: no error
+            // bubble on first-visit permission prompt; the mic
+            // button remains as manual fallback.
+            if (!micArmed) {
+                startMicCapture(true).then((ok) => {
+                    if (ok) console.log('Mic armed for wake word');
+                });
+            }
         };
 
         ws.onclose = () => {
@@ -613,6 +625,14 @@
                         isPlayingTts = false;
                         isListeningState = true;
                         setStatus('listening');
+                        break;
+                    case 'wake':
+                        // Server heard "alexa" while idle:
+                        // enter voice mode automatically.
+                        if (!isVoiceActive) {
+                            console.log('Wake word: auto-starting voice');
+                            await startVoice();
+                        }
                         break;
                     case 'idle':
                         isListeningState = false;
@@ -702,7 +722,7 @@
     // ============================================================
     // BROWSER MIC CAPTURE (AudioWorklet → WebSocket)
     // ============================================================
-    async function startMicCapture() {
+    async function startMicCapture(quiet = false) {
         try {
             micStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
@@ -715,24 +735,38 @@
             });
 
             audioCtx = new AudioContext({ sampleRate: 16000 });
+            // Chrome suspends AudioContext without a user gesture;
+            // resume on the first click/keypress if needed.
+            if (audioCtx.state === 'suspended') {
+                const resumeOnce = () => {
+                    audioCtx?.resume().catch(() => {});
+                };
+                window.addEventListener('pointerdown', resumeOnce, { once: true });
+                window.addEventListener('keydown', resumeOnce, { once: true });
+                await audioCtx.resume().catch(() => {});
+            }
             await audioCtx.audioWorklet.addModule('/audio-processor.js');
 
             const source = audioCtx.createMediaStreamSource(micStream);
             workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
 
-            // ONLY send PCM chunks when actively in listening state
-            // (or while TTS plays, for "alexa" barge-in detection)
+            // Stream whenever the mic is hot. The server decides
+            // by state: VAD while listening, "alexa" detection
+            // while idle/TTS, dropped otherwise.
             workletNode.port.onmessage = (e) => {
-                if (ws && ws.readyState === WebSocket.OPEN && isVoiceActive && (isListeningState || isPlayingTts)) {
+                if (ws && ws.readyState === WebSocket.OPEN && micArmed) {
                     ws.send(e.data);
                 }
             };
 
             source.connect(workletNode);
+            micArmed = true;
             return true;
         } catch (err) {
             console.error('Mic capture failed:', err);
-            addMessage('Could not access microphone. Please allow microphone access and try again.', 'assistant');
+            if (!quiet) {
+                addMessage('Could not access microphone. Please allow microphone access and try again.', 'assistant');
+            }
             return false;
         }
     }
@@ -773,8 +807,12 @@
 
         hideWelcome();
 
-        const ok = await startMicCapture();
-        if (!ok) return;
+        // Mic is usually already hot (wake-word armed); capture
+        // only if needed.
+        if (!micArmed) {
+            const ok = await startMicCapture();
+            if (!ok) return;
+        }
 
         isVoiceActive = true;
         micBtn.classList.add('active');
@@ -795,18 +833,28 @@
 
         // Stop TTS
         if (currentTtsAudio) {
-            currentTtsAudio.pause();
+            try {
+                currentTtsAudio.pause();
+                currentTtsAudio.src = '';
+            } catch (e) {}
             currentTtsAudio = null;
         }
+        ttsChunks = [];
 
-        stopMicCapture();
-
+        // NOTE: mic stays hot on purpose — "alexa" must keep
+        // working to re-start voice mode. Tracks are released
+        // only on page unload.
         if (notifyServer && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ action: 'stop' }));
         }
 
         setStatus('ready');
     }
+
+    // Release the mic for real when leaving the page.
+    window.addEventListener('beforeunload', () => {
+        stopMicCapture();
+    });
 
     // ============================================================
     // TEXT CHAT (SSE)

@@ -96,6 +96,11 @@ async def lifespan(app: FastAPI):
     print("Preloading embedding model...")
     get_embedding_model()
     print("Embedding model ready.\n")
+
+    # Preload wake-word model so "alexa" is armed from boot
+    print("Preloading wake word model...")
+    await get_wake_model()
+    print()
     yield
 
 # ============================================================
@@ -1002,10 +1007,14 @@ async def websocket_voice(ws: WebSocket):
                 raw = msg["bytes"]
                 int16 = np.frombuffer(raw, dtype=np.int16)
 
-                # Barge-in: run wake-word detection on mic audio
-                # while TTS is streaming/playing. Saying "alexa"
-                # cuts playback and returns to listening.
-                if state in ("speaking", "waiting_playback"):
+                # Wake-word detection ("alexa") in two states:
+                #  - speaking/waiting_playback → barge-in interrupt
+                #  - idle → auto-start voice mode ("wake" event)
+                if state in (
+                    "speaking",
+                    "waiting_playback",
+                    "idle",
+                ):
                     if _wake_model is None:
                         asyncio.create_task(get_wake_model())
                     elif (
@@ -1044,6 +1053,19 @@ async def websocket_voice(ws: WebSocket):
                                 break
                         if interrupted:
                             last_wake_time = time.time()
+                            ww_buffer = np.zeros(
+                                0, dtype=np.int16
+                            )
+                            if state == "idle":
+                                print(
+                                    "🔔 Wake word 'alexa' "
+                                    f"(score={best_score:.2f}) — "
+                                    "auto-starting voice mode"
+                                )
+                                await safe_send_json(
+                                    {"status": "wake"}
+                                )
+                                continue
                             print(
                                 "⏹️ Wake word 'alexa' "
                                 f"(score={best_score:.2f}) — "
@@ -1056,9 +1078,6 @@ async def websocket_voice(ws: WebSocket):
                             recorded_chunks.clear()
                             speech_triggered = False
                             silence_counter = 0
-                            ww_buffer = np.zeros(
-                                0, dtype=np.int16
-                            )
                             last_speech_time = time.time()
                             vad_model.reset_states()
                             await safe_send_json(
