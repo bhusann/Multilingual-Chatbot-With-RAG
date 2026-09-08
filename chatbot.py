@@ -430,7 +430,7 @@ def audio_callback(
 
 WHISPER_SERVER_URL = os.environ.get(
     "WHISPER_SERVER_URL",
-    "https://ghost-1.tail1a7c93.ts.net/inference",
+    "http://127.0.0.1:8080/inference",
 )
 
 print(

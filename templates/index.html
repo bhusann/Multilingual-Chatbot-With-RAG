@@ -522,6 +522,9 @@
     let ws = null;
     let isVoiceActive = false;
     let isListeningState = false;
+    // True while server streams/plays TTS: mic frames keep
+    // flowing so the server can hear the "alexa" barge-in.
+    let isPlayingTts = false;
     let audioCtx = null;
     let micStream = null;
     let workletNode = null;
@@ -578,19 +581,38 @@
                 switch (data.status) {
                     case 'listening':
                         isListeningState = true;
+                        isPlayingTts = false;
                         setStatus('listening');
                         break;
                     case 'transcribing':
                         isListeningState = false;
+                        isPlayingTts = false;
                         setStatus('transcribing');
                         break;
                     case 'thinking':
                         isListeningState = false;
+                        isPlayingTts = false;
                         setStatus('thinking');
                         break;
                     case 'speaking':
                         isListeningState = false;
+                        isPlayingTts = true;
                         setStatus('speaking');
+                        break;
+                    case 'interrupt':
+                        // Server heard "alexa" during TTS: kill
+                        // playback NOW, mic is already live.
+                        try {
+                            if (currentTtsAudio) {
+                                currentTtsAudio.pause();
+                                currentTtsAudio.src = '';
+                            }
+                        } catch (e) {}
+                        currentTtsAudio = null;
+                        ttsChunks = [];
+                        isPlayingTts = false;
+                        isListeningState = true;
+                        setStatus('listening');
                         break;
                     case 'idle':
                         isListeningState = false;
@@ -599,14 +621,22 @@
                         break;
                     case 'tts_start':
                         isListeningState = false;
+                        isPlayingTts = true;
                         ttsChunks = [];
                         break;
                     case 'tts_done':
                         isListeningState = false;
                         await playTTS();
+                        isPlayingTts = false;
                         if (ws && ws.readyState === WebSocket.OPEN && isVoiceActive) {
                             ws.send(JSON.stringify({ action: 'ready' }));
                         }
+                        break;
+                    case 'tts_cancel':
+                        // Interrupted or stopped mid-synthesis:
+                        // drop partial audio, play nothing.
+                        ttsChunks = [];
+                        isPlayingTts = false;
                         break;
                 }
                 return;
@@ -658,6 +688,14 @@
         } finally {
             URL.revokeObjectURL(url);
             currentTtsAudio = null;
+            // Tell the server playback ended so it resumes
+            // listening immediately (without this, every turn
+            // waits out the 25s server fallback timer).
+            try {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ action: 'playback_done' }));
+                }
+            } catch (e) {}
         }
     }
 
@@ -683,8 +721,9 @@
             workletNode = new AudioWorkletNode(audioCtx, 'pcm-processor');
 
             // ONLY send PCM chunks when actively in listening state
+            // (or while TTS plays, for "alexa" barge-in detection)
             workletNode.port.onmessage = (e) => {
-                if (ws && ws.readyState === WebSocket.OPEN && isVoiceActive && isListeningState) {
+                if (ws && ws.readyState === WebSocket.OPEN && isVoiceActive && (isListeningState || isPlayingTts)) {
                     ws.send(e.data);
                 }
             };
@@ -749,6 +788,7 @@
     function stopVoice(notifyServer = true) {
         isVoiceActive = false;
         isListeningState = false;
+        isPlayingTts = false;
         micBtn.classList.remove('active');
         micBtn.innerHTML = '🎤';
         micBtn.title = 'Start voice';

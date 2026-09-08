@@ -314,8 +314,16 @@ class LLMService:
         # session id (stable for the process lifetime).
         self._zen_session = f"ses_{uuid.uuid4().hex[:24]}"
 
-        # Build system prompt ONCE
-        self.system_prompt = self._build_system_prompt()
+        # Static base prompt (built once) + RAG inventory snapshot.
+        # `system_prompt` combines both, but each chat session
+        # FREEZES its copy at creation time. Uploads/deletes do
+        # NOT rewrite live prompts — they broadcast a one-line
+        # event note into each session instead (see webapp
+        # _broadcast_rag_event). Only brand-new sessions snapshot
+        # the current file list.
+        self._base_system_prompt = self._build_system_prompt()
+        self._inventory_text = ""
+        self.refresh_inventory()
 
         if OPENCODE_API_KEY:
 
@@ -604,6 +612,60 @@ class LLMService:
             return raw_result
         else:
             return str(raw_result)
+
+    @property
+    def system_prompt(self):
+        """Base prompt + current RAG document inventory."""
+        if self._inventory_text:
+            return (
+                f"{self._base_system_prompt}\n\n"
+                f"{self._inventory_text}"
+            )
+        return self._base_system_prompt
+
+    def refresh_inventory(self):
+        """
+        Rebuild the RAG document inventory section from the
+        vector store. Call after admin upload/delete (and once
+        at startup). Never raises — a failed refresh keeps the
+        previous inventory.
+        """
+        try:
+            from rag.vector_store import VectorStore
+
+            docs = VectorStore().list_documents()
+        except Exception as e:
+            print(f"⚠️ inventory refresh failed: {e}")
+            return
+
+        if not docs:
+            self._inventory_text = (
+                "KNOWLEDGE BASE (uploaded documents)\n"
+                "===================================\n"
+                "No documents have been uploaded yet. Do NOT "
+                "call rag_search — answer from web_search or "
+                "your own knowledge."
+            )
+            return
+
+        lines = []
+        for d in docs:
+            name = d.get("filename") or d.get("doc_id", "?")
+            scheme = d.get("scheme_name") or ""
+            chunks = d.get("total_chunks", 0)
+            extra = f", scheme: {scheme}" if scheme else ""
+            lines.append(f"- {name} ({chunks} chunks{extra})")
+
+        self._inventory_text = (
+            "KNOWLEDGE BASE (uploaded documents)\n"
+            "===================================\n"
+            "These documents are available via the `rag_search` "
+            "tool. When the user's question may relate to any of "
+            "them, ALWAYS call rag_search FIRST before answering "
+            "from general knowledge or web_search. If the question "
+            "is unrelated to these documents, skip rag_search.\n"
+            + "\n".join(lines)
+        )
 
     def _build_system_prompt(self):
         """Build the system prompt once at startup."""
@@ -1163,10 +1225,14 @@ GRIEVANCE SKILL GUIDE
             )
 
         system_prompt = self.system_prompt
-        if chat_history and chat_history[0].get("role") == "system":
-            chat_history[0]["content"] = system_prompt
-
+        # NOTE: history[0] is intentionally NOT overwritten here.
+        # Each session keeps the system prompt it was created
+        # with; doc add/remove arrives as a one-line event note
+        # in history instead of a prompt rewrite. The loop is fed
+        # the session's FROZEN copy below.
         prior_turns = chat_history[1:] if chat_history else []
+        if chat_history and chat_history[0].get("role") == "system":
+            system_prompt = chat_history[0]["content"]
         new_messages = []
 
         try:
@@ -1214,10 +1280,12 @@ GRIEVANCE SKILL GUIDE
             return
 
         system_prompt = self.system_prompt
-        if chat_history and chat_history[0].get("role") == "system":
-            chat_history[0]["content"] = system_prompt
-
+        # NOTE: history[0] is intentionally NOT overwritten here
+        # (see _generate_response_sync). Feed the loop the
+        # session's FROZEN copy.
         prior_turns = chat_history[1:] if chat_history else []
+        if chat_history and chat_history[0].get("role") == "system":
+            system_prompt = chat_history[0]["content"]
         new_messages = []
         full_reply = ""
 

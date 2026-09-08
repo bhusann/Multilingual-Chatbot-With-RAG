@@ -67,7 +67,7 @@ ADMIN_PASSWORD = os.environ.get(
 
 WHISPER_SERVER_URL = os.environ.get(
     "WHISPER_SERVER_URL",
-    "https://ghost-1.tail1a7c93.ts.net/inference",
+    "http://127.0.0.1:8080/inference",
 )
 
 # Voice pipeline config
@@ -124,6 +124,8 @@ _llm = None
 _retriever = None
 _store = None
 _vad_model = None
+_wake_model = None
+_wake_loading = False
 
 
 def get_llm():
@@ -162,6 +164,17 @@ def get_store():
     return _store
 
 
+# Wake-word barge-in ("alexa" interrupts TTS), same model
+# as the legacy terminal assistant.
+WAKE_WORD_MODEL = "alexa_v0.1"
+WAKE_FRAME_SAMPLES = 1280  # 80ms @ 16kHz, what openWakeWord eats
+WAKE_THRESHOLD = 0.65
+WAKE_COOLDOWN_S = 2.0
+# Frames to skip after entering speaking: the tail of the
+# user's own utterance + TTS onset must not false-trigger.
+WAKE_SETTLE_FRAMES = int(1.0 * 16000 / 1280)
+
+
 def get_vad_model():
     """Lazy-load Silero VAD model (only when voice is first used)."""
     global _vad_model
@@ -173,6 +186,50 @@ def get_vad_model():
         )
         print("Silero VAD loaded for web voice pipeline.")
     return _vad_model
+
+
+_wake_model = None
+_wake_loading = False
+
+
+async def get_wake_model():
+    """Lazy-load openWakeWord alexa model in a worker thread."""
+    global _wake_model, _wake_loading
+    if _wake_model is not None:
+        return _wake_model
+    if _wake_loading:
+        return None
+    _wake_loading = True
+    try:
+        def _load():
+            import warnings
+            from openwakeword import Model as WakeWordModel
+            import openwakeword as _oww_pkg
+            path = os.path.join(
+                os.path.dirname(_oww_pkg.__file__),
+                "resources",
+                "models",
+                f"{WAKE_WORD_MODEL}.onnx",
+            )
+            # CPU-only onnxruntime here: the model asks for CUDA
+            # first and falls back. The warning is noise — a 80ms
+            # wake-word frame costs ~ms on CPU anyway.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=".*CUDAExecutionProvider.*",
+                )
+                return WakeWordModel(
+                    wakeword_model_paths=[path]
+                )
+
+        _wake_model = await asyncio.to_thread(_load)
+        print("Wake word model ready (alexa barge-in).")
+    except Exception as e:
+        print(f"⚠️ Wake word model unavailable: {e}")
+    finally:
+        _wake_loading = False
+    return _wake_model
 
 
 # ============================================================
@@ -200,8 +257,14 @@ def _get_or_create_session(session_id=None):
         session["last_access"] = now
         return session_id, session
 
-    # Create new session
+    # Create new session — snapshot the CURRENT RAG inventory
+    # into its frozen system prompt. Later uploads/deletes reach
+    # this session only as one-line event notes, never rewrites.
     llm = get_llm()
+    try:
+        llm.refresh_inventory()
+    except Exception as e:
+        print(f"⚠️ inventory refresh failed: {e}")
     new_id = uuid.uuid4().hex[:16]
     _chat_sessions[new_id] = {
         "history": [
@@ -210,6 +273,24 @@ def _get_or_create_session(session_id=None):
         "last_access": now,
     }
     return new_id, _chat_sessions[new_id]
+
+
+def _broadcast_rag_event(text):
+    """
+    Append a one-line RAG availability note to every live
+    session. Sent as role=system so it is never shown in the
+    chat UI, never spoken by TTS, and never rewrites anyone's
+    frozen system prompt.
+    """
+    note = (
+        f"[RAG UPDATE — {text} "
+        f"Adjust your use of the rag_search tool accordingly, "
+        f"without commenting on this note.]"
+    )
+    for session in _chat_sessions.values():
+        session["history"].append(
+            {"role": "system", "content": note}
+        )
 
 
 # ============================================================
@@ -668,7 +749,8 @@ async def websocket_voice(ws: WebSocket):
       - 'listening': Receiving mic frames, running VAD
       - 'processing': Transcribing with whisper, running LLM
       - 'speaking': Streaming TTS audio to browser
-      - 'waiting_playback': Browser is playing TTS, mic muted
+      - 'waiting_playback': Browser is playing TTS, mic frames
+        feed wake-word barge-in ("alexa" interrupts)
     """
     import numpy as np
     import torch
@@ -680,6 +762,10 @@ async def websocket_voice(ws: WebSocket):
 
     vad_model = get_vad_model()
 
+    # Preload wake-word model in background so barge-in is
+    # ready before the first TTS playback ends.
+    asyncio.create_task(get_wake_model())
+
     # Per-connection state
     state = "idle"  # idle | listening | processing | speaking | waiting_playback
     vad_buffer = np.zeros(0, dtype=np.float32)
@@ -687,6 +773,9 @@ async def websocket_voice(ws: WebSocket):
     speech_triggered = False
     silence_counter = 0
     last_speech_time = time.time()
+    ww_buffer = np.zeros(0, dtype=np.int16)
+    ww_settle_frames = 0
+    last_wake_time = 0.0
 
     chunks_per_second = SAMPLE_RATE / VAD_CHUNK_SIZE
     max_silence_chunks = int(
@@ -719,6 +808,7 @@ async def websocket_voice(ws: WebSocket):
 
     async def handle_utterance(utterance):
         nonlocal state, last_speech_time
+        nonlocal ww_buffer, ww_settle_frames
 
         duration = len(utterance) / SAMPLE_RATE
         print(f"🎤 Captured {duration:.1f}s of audio")
@@ -810,6 +900,17 @@ async def websocket_voice(ws: WebSocket):
         state = "speaking"
         await safe_send_json({"status": "speaking"})
 
+        # Reset barge-in detection: the tail of the user's own
+        # utterance lingering in the mic path must not score as
+        # "alexa" once TTS starts. Skip the first ~1s of audio.
+        ww_buffer = np.zeros(0, dtype=np.int16)
+        ww_settle_frames = WAKE_SETTLE_FRAMES
+        try:
+            if _wake_model is not None:
+                _wake_model.reset()
+        except Exception:
+            pass
+
         tts_text = _clean_for_tts(reply)
         has_audio = False
 
@@ -821,17 +922,32 @@ async def websocket_voice(ws: WebSocket):
                 await safe_send_json({"status": "tts_start"})
 
                 async for tts_chunk in communicate.stream():
+                    if state != "speaking":
+                        break  # wake-word barge-in interrupted us
                     if ws.client_state != WebSocketState.CONNECTED:
                         break
                     if tts_chunk["type"] == "audio":
                         if await safe_send_bytes(tts_chunk["data"]):
                             has_audio = True
 
-                await safe_send_json({"status": "tts_done"})
             except Exception as e:
                 print(f"⚠️ TTS error: {e}")
+            finally:
+                # Close the playback loop on the browser — even on
+                # error/empty audio — or it waits out the 25s
+                # fallback timer every time. After a barge-in
+                # interrupt, send tts_cancel so the browser drops
+                # the partial audio instead of replaying it.
+                if state == "speaking":
+                    await safe_send_json({"status": "tts_done"})
+                else:
+                    await safe_send_json({"status": "tts_cancel"})
 
         if ws.client_state != WebSocketState.CONNECTED:
+            return
+
+        if state != "speaking":
+            # Barge-in already flipped us back to listening.
             return
 
         if has_audio:
@@ -883,12 +999,80 @@ async def websocket_voice(ws: WebSocket):
 
             # Binary: audio data from browser mic
             if msg.get("bytes"):
+                raw = msg["bytes"]
+                int16 = np.frombuffer(raw, dtype=np.int16)
+
+                # Barge-in: run wake-word detection on mic audio
+                # while TTS is streaming/playing. Saying "alexa"
+                # cuts playback and returns to listening.
+                if state in ("speaking", "waiting_playback"):
+                    if _wake_model is None:
+                        asyncio.create_task(get_wake_model())
+                    elif (
+                        time.time() - last_wake_time
+                        > WAKE_COOLDOWN_S
+                    ):
+                        ww_buffer = np.concatenate(
+                            [ww_buffer, int16]
+                        )
+                        if len(ww_buffer) > SAMPLE_RATE * 2:
+                            ww_buffer = ww_buffer[
+                                -SAMPLE_RATE * 2:
+                            ]
+                        interrupted = False
+                        best_score = 0.0
+                        while len(ww_buffer) >= WAKE_FRAME_SAMPLES:
+                            frame = ww_buffer[:WAKE_FRAME_SAMPLES]
+                            ww_buffer = ww_buffer[
+                                WAKE_FRAME_SAMPLES:
+                            ]
+                            if ww_settle_frames > 0:
+                                # Settle window: drop frames
+                                # without scoring.
+                                ww_settle_frames -= 1
+                                continue
+                            try:
+                                score = _wake_model.predict(
+                                    frame
+                                ).get(WAKE_WORD_MODEL, 0.0)
+                            except Exception:
+                                score = 0.0
+                            if score > best_score:
+                                best_score = score
+                            if score > WAKE_THRESHOLD:
+                                interrupted = True
+                                break
+                        if interrupted:
+                            last_wake_time = time.time()
+                            print(
+                                "⏹️ Wake word 'alexa' "
+                                f"(score={best_score:.2f}) — "
+                                "interrupting TTS, listening"
+                            )
+                            state = "listening"
+                            vad_buffer = np.zeros(
+                                0, dtype=np.float32
+                            )
+                            recorded_chunks.clear()
+                            speech_triggered = False
+                            silence_counter = 0
+                            ww_buffer = np.zeros(
+                                0, dtype=np.int16
+                            )
+                            last_speech_time = time.time()
+                            vad_model.reset_states()
+                            await safe_send_json(
+                                {"status": "interrupt"}
+                            )
+                            await safe_send_json(
+                                {"status": "listening"}
+                            )
+                    continue
+
                 # ONLY process audio when actively in "listening" state
                 if state != "listening":
                     continue
 
-                raw = msg["bytes"]
-                int16 = np.frombuffer(raw, dtype=np.int16)
                 float32 = int16.astype(np.float32) / 32768.0
 
                 vad_buffer = np.concatenate([vad_buffer, float32])
@@ -1067,6 +1251,12 @@ async def upload_document(
     from rag.ingest import ingest_document
     store = get_store()
     result = ingest_document(filepath, vector_store=store)
+    # Tell live sessions the doc is now searchable (no prompt
+    # rewrite — just a one-line event note).
+    _broadcast_rag_event(
+        f"the document '{file.filename}' is now available "
+        f"through rag_search."
+    )
     return JSONResponse(result)
 
 
@@ -1078,7 +1268,25 @@ async def delete_document(
 ):
     """Delete a document and all its chunks."""
     store = get_store()
+    try:
+        docs = store.list_documents()
+        filename = next(
+            (
+                d.get("filename", doc_id)
+                for d in docs
+                if d.get("doc_id") == doc_id
+            ),
+            doc_id,
+        )
+    except Exception:
+        filename = doc_id
     store.delete_document(doc_id)
+    # Tell live sessions the doc is gone (no prompt rewrite —
+    # just a one-line event note).
+    _broadcast_rag_event(
+        f"the document '{filename}' is now NOT available "
+        f"through rag_search. Do not cite its contents."
+    )
     return JSONResponse({"status": "deleted", "doc_id": doc_id})
 
 
